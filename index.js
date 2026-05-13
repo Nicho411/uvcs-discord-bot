@@ -12,8 +12,7 @@ const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || 'https://discord.
 // Como pegar o User ID: Discord > Configurações > Avançado > Ativar Modo Desenvolvedor
 // Depois clique com botão direito no usuário > "Copiar ID do usuário"
 const REVIEWER_MAP = {
-  // 'username.no.uvcs': 'ID_DO_DISCORD',
-  'nicholaspedroso@outlook.com':  'Nicho411',
+  'nicholaspedroso@outlook.com': '192641612659163137',
 };
 
 const PORT = process.env.PORT || 3000;
@@ -38,8 +37,8 @@ function buildDiscordEmbed(payload) {
 
   const mention = getMention(reviewer);
   const mentionLine = mention
-    ? `👤 **Revisor:** ${mention}`
-    : '👤 Revisor não identificado';
+      ? `👤 **Revisor:** ${mention}`
+      : '👤 Revisor não identificado';
 
   // Monta campos opcionais
   const fields = [];
@@ -107,7 +106,7 @@ app.get('/test', async (req, res) => {
     event:      'codereview.created',
     title:      'Refactor: sistema de inventário',
     owner:      'joao.silva',
-    assignee:   'maria.souza',  // ← troque para um username que está no seu REVIEWER_MAP
+    assignee:   'nicholaspedroso@outlook.com',
     repository: 'MeuJogo',
     branch:     '/main/feature-inventario',
     url:        'https://dashboard.unity3d.com/devops',
