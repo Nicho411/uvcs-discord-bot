@@ -111,13 +111,17 @@ function buildMessage(payload) {
         }],
       };
 
-    case 'comment':
-      // Menciona quem comentou
+    case 'comment': {
+      // Extrai o texto do comentário (tudo antes do link <plastic://...>)
+      const { desc } = parsePayload(payload);
+      const commentText = desc.replace(/<plastic:\/\/[^>]+>/g, '').trim() || null;
+
       return {
         content: `${actorMention} adicionou um comentário no review 💬`,
         embeds: [{
           title: `💬 ${reviewName}`,
           color: 0xEB459E, // rosa
+          description: commentText ?? undefined,
           fields: [
             { name: '👤 Comentado por', value: actor || 'desconhecido', inline: true },
             { name: '📁 Repositório',   value: repo  || 'desconhecido', inline: true },
@@ -126,6 +130,7 @@ function buildMessage(payload) {
           timestamp: new Date().toISOString(),
         }],
       };
+    }
 
     default:
       return null;
