@@ -43,36 +43,67 @@ function getMention(email) {
   return id ? `<@${id}>` : `**${email}**`; // fallback: email em negrito
 }
 
-// Detecta o tipo de evento com base na description do embed
-function detectEvent(desc) {
+// Detecta o tipo de evento — suporta payload PLASTIC_* (servidor real) e embeds (teste)
+function detectEvent(payload) {
+  // Payload estruturado do servidor real
+  if (payload.PLASTIC_REVIEW_ACTION !== undefined) {
+    const action      = payload.PLASTIC_REVIEW_ACTION ?? '';
+    const commentAct  = payload.PLASTIC_REVIEW_COMMENT_ACTION ?? '';
+    const status      = payload.PLASTIC_REVIEW_STATUS ?? '';
+
+    if (action.includes('ReviewerAssigned') || action.includes('Assigned')) return 'review_requested';
+    if (action.includes('Reviewed') || status === 'Reviewed')               return 'status_reviewed';
+    if (action.includes('Rework')   || status === 'Rework required')        return 'status_rework';
+    if (commentAct === 'Created' && payload.PLASTIC_REVIEW_COMMENT)         return 'comment';
+    return 'under_review';
+  }
+
+  // Payload legado via embeds (usado nos testes /test)
+  const desc = payload.embeds?.[0]?.description ?? '';
   if (desc.includes('requested-review-from')) return 'review_requested';
   if (desc.includes('[status-reviewed]'))     return 'status_reviewed';
   if (desc.includes('[status-rework]'))       return 'status_rework';
   if (desc.includes('Under review'))          return 'under_review';
-  return 'comment'; // qualquer outro texto é tratado como comentário
+  return 'comment';
 }
 
-// Extrai dados comuns do payload do UVCS
+// Extrai dados comuns do payload — suporta ambos os formatos
 function parsePayload(payload) {
-  const embed      = payload.embeds?.[0] ?? {};
-  const desc       = embed.description ?? '';
-  const actor      = embed.title ?? '';        // quem fez a ação
-  const repo       = embed.footer?.text ?? '';
-  const reviewName = payload.content?.match(/review `([^`]+)`/)?.[1] ?? 'Code Review';
-  const eventType  = detectEvent(desc);
+  // Payload estruturado do servidor real (campos PLASTIC_*)
+  if (payload.PLASTIC_REVIEW_ACTION !== undefined) {
+    return {
+      actor:      payload.PLASTIC_REVIEW_OWNER    ?? payload.PLASTIC_USER ?? '',
+      repo:       payload.PLASTIC_REPOSITORY_NAME ?? '',
+      reviewName: payload.PLASTIC_REVIEW_TITLE    ?? 'Code Review',
+      eventType:  detectEvent(payload),
+      reviewer:   payload.PLASTIC_REVIEW_ASSIGNEE ?? null,
+      comment:    payload.PLASTIC_REVIEW_COMMENT  ?? null,
+      branch:     payload.PLASTIC_REVIEW_TARGET   ?? '',
+      actionActor: payload.PLASTIC_USER           ?? '',  // quem disparou o evento
+    };
+  }
 
-  // Em review_requested, o email do revisor está na description
+  // Payload legado via embeds (testes)
+  const embed  = payload.embeds?.[0] ?? {};
+  const desc   = embed.description ?? '';
   const reviewerMatch = desc.match(/\[requested-review-from-([^\]]+)\]/);
-  const reviewer = reviewerMatch ? reviewerMatch[1] : null;
-
-  return { embed, desc, actor, repo, reviewName, eventType, reviewer };
+  return {
+    actor:      embed.title ?? '',
+    repo:       embed.footer?.text ?? '',
+    reviewName: payload.content?.match(/review `([^`]+)`/)?.[1] ?? 'Code Review',
+    eventType:  detectEvent(payload),
+    reviewer:   reviewerMatch ? reviewerMatch[1] : null,
+    comment:    desc.replace(/<plastic:\/\/[^>]+>/g, '').replace(/\[.*?\]/g, '').trim() || null,
+    branch:     '',
+    actionActor: embed.title ?? '',
+  };
 }
 
 // Monta a mensagem do Discord de acordo com o tipo de evento
 function buildMessage(payload) {
-  const { actor, repo, reviewName, eventType, reviewer } = parsePayload(payload);
+  const { actor, repo, reviewName, eventType, reviewer, comment, branch, actionActor } = parsePayload(payload);
 
-  const actorMention    = getMention(actor);
+  const actorMention    = getMention(actionActor || actor);
   const reviewerMention = getMention(reviewer ?? actor);
 
   switch (eventType) {
@@ -101,7 +132,7 @@ function buildMessage(payload) {
           title: `✅ ${reviewName}`,
           color: 0x57F287, // verde
           fields: [
-            { name: '👤 Revisado por', value: actor || 'desconhecido', inline: true },
+            { name: '👤 Revisado por', value: actionActor || actor || 'desconhecido', inline: true },
             { name: '📁 Repositório',  value: repo  || 'desconhecido', inline: true },
           ],
           footer: { text: 'Unity Version Control · Status Atualizado' },
@@ -117,7 +148,7 @@ function buildMessage(payload) {
           title: `⚠️ ${reviewName}`,
           color: 0xFEE75C, // amarelo
           fields: [
-            { name: '👤 Solicitado por', value: actor || 'desconhecido', inline: true },
+            { name: '👤 Solicitado por', value: actionActor || actor || 'desconhecido', inline: true },
             { name: '📁 Repositório',    value: repo  || 'desconhecido', inline: true },
           ],
           footer: { text: 'Unity Version Control · Rework Solicitado' },
@@ -125,26 +156,21 @@ function buildMessage(payload) {
         }],
       };
 
-    case 'comment': {
-      // Extrai o texto do comentário (tudo antes do link <plastic://...>)
-      const { desc } = parsePayload(payload);
-      const commentText = desc.replace(/<plastic:\/\/[^>]+>/g, '').trim() || null;
-
+    case 'comment':
       return {
         content: `${actorMention} adicionou um comentário no review 💬`,
         embeds: [{
           title: `💬 ${reviewName}`,
           color: 0xEB459E, // rosa
-          description: commentText ?? undefined,
+          description: comment ?? undefined,
           fields: [
-            { name: '👤 Comentado por', value: actor || 'desconhecido', inline: true },
+            { name: '👤 Comentado por', value: actionActor || actor || 'desconhecido', inline: true },
             { name: '📁 Repositório',   value: repo  || 'desconhecido', inline: true },
           ],
           footer: { text: 'Unity Version Control · Novo Comentário' },
           timestamp: new Date().toISOString(),
         }],
       };
-    }
 
     default:
       return null;
