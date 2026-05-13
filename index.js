@@ -6,7 +6,7 @@ app.use(express.json());
 // CONFIGURAÇÕES — edite aqui
 // ─────────────────────────────────────────────
 
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || 'https://discord.com/api/webhooks/1504203276059414600/un00IXg2dncFWt0m-BPhMxeJ1ZlK4b50tTpGuOMrfJp5PWwvFkp4MwLfG-PovfQPM1QH';
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || 'COLE_AQUI_O_WEBHOOK_DO_DISCORD';
 
 // Mapeamento: username exato do UVCS → User ID do Discord
 // Como pegar o User ID: Discord > Configurações > Avançado > Ativar Modo Desenvolvedor
@@ -27,31 +27,56 @@ function getMention(username) {
   return id ? `<@${id}>` : `**@${username}**`; // fallback: nome em negrito
 }
 
+function extractReviewer(payload) {
+  // O UVCS envia o payload já formatado para o Discord
+  // O revisor aparece em embeds[0].title ou na description como [requested-review-from-EMAIL]
+  const embed = payload.embeds?.[0];
+  if (!embed) return null;
+
+  // Tenta pegar do título do embed
+  const title = embed.title ?? '';
+  if (title.includes('@')) return title.trim();
+
+  // Tenta extrair da description: [requested-review-from-EMAIL]
+  const desc = embed.description ?? '';
+  const match = desc.match(/\[requested-review-from-([^\]]+)\]/);
+  if (match) return match[1].trim();
+
+  return null;
+}
+
 function buildDiscordEmbed(payload) {
-  const reviewer  = payload.assignee ?? payload.reviewer ?? payload.reviewers?.[0] ?? null;
+  const reviewer  = payload.assignee ?? payload.reviewer ?? payload.reviewers?.[0] ?? extractReviewer(payload);
   const owner     = payload.owner   ?? payload.author    ?? 'desconhecido';
-  const title     = payload.title   ?? 'Novo Code Review';
-  const repo      = payload.repository ?? payload.repo ?? '';
+  const embed     = payload.embeds?.[0];
+  const title     = payload.title   ?? (embed?.title && !embed.title.includes('@') ? embed.title : null) ?? 'Novo Code Review';
+  const repo      = payload.repository ?? payload.repo ?? embed?.footer?.text ?? '';
   const branch    = payload.branch  ?? '';
-  const reviewUrl = payload.url     ?? payload.reviewUrl ?? '';
+
+  // Extrai a URL plástica da description e converte para link do dashboard
+  const desc      = embed?.description ?? '';
+  const urlMatch  = desc.match(/<(plastic:\/\/[^>]+)>/);
+  const reviewUrl = payload.url ?? payload.reviewUrl ?? (urlMatch ? urlMatch[1] : '') ?? '';
+
+  // Extrai o nome do review do content: "New comment to the review `NOME`"
+  const contentMatch = payload.content?.match(/review `([^`]+)`/);
+  const reviewName = contentMatch ? contentMatch[1] : title;
 
   const mention = getMention(reviewer);
   const mentionLine = mention
       ? `👤 **Revisor:** ${mention}`
       : '👤 Revisor não identificado';
 
-  // Monta campos opcionais
   const fields = [];
-  if (repo)    fields.push({ name: '📁 Repositório', value: repo,   inline: true });
-  if (branch)  fields.push({ name: '🌿 Branch',      value: branch, inline: true });
-  if (owner)   fields.push({ name: '✏️ Autor',       value: owner,  inline: true });
+  if (repo)   fields.push({ name: '📁 Repositório', value: repo,   inline: true });
+  if (branch) fields.push({ name: '🌿 Branch',      value: branch, inline: true });
+  if (owner !== 'desconhecido') fields.push({ name: '✏️ Autor', value: owner, inline: true });
 
   return {
     content: mention ? `${mention} você tem um novo Code Review para revisar!` : mentionLine,
     embeds: [{
-      title: `🔍 ${title}`,
-      url:   reviewUrl || undefined,
-      color: 0x5865F2, // azul Discord
+      title: `🔍 ${reviewName}`,
+      color: 0x5865F2,
       fields,
       footer: { text: 'Unity Version Control · Code Review' },
       timestamp: new Date().toISOString(),
@@ -68,10 +93,15 @@ app.post('/uvcs-webhook', async (req, res) => {
 
   console.log('[UVCS] Payload recebido:', JSON.stringify(payload, null, 2));
 
-  // Filtra apenas eventos de Code Review (ajuste o campo/valor conforme seu UVCS)
+  // Filtra apenas eventos de atribuição de revisor
+  // O UVCS indica isso com [requested-review-from-...] na description
+  const desc = payload.embeds?.[0]?.description ?? '';
+  const isReviewRequest = desc.includes('requested-review-from');
   const eventType = payload.event ?? payload.type ?? '';
-  if (eventType && !eventType.toLowerCase().includes('review')) {
-    console.log('[UVCS] Evento ignorado:', eventType);
+  const isReviewEvent = eventType.toLowerCase().includes('review');
+
+  if (!isReviewRequest && !isReviewEvent) {
+    console.log('[UVCS] Evento ignorado (não é atribuição de revisor)');
     return res.sendStatus(200);
   }
 
