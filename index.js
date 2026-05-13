@@ -8,11 +8,13 @@ app.use(express.json());
 
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || 'COLE_AQUI_O_WEBHOOK_DO_DISCORD';
 
-// Mapeamento: username exato do UVCS → User ID do Discord
+// Mapeamento: email exato do UVCS → User ID do Discord
 // Como pegar o User ID: Discord > Configurações > Avançado > Ativar Modo Desenvolvedor
 // Depois clique com botão direito no usuário > "Copiar ID do usuário"
 const REVIEWER_MAP = {
   'nicholaspedroso@outlook.com': '192641612659163137',
+  // adicione mais membros da equipe aqui:
+  // 'outro@email.com': '000000000000000000',
 };
 
 const PORT = process.env.PORT || 3000;
@@ -21,67 +23,113 @@ const PORT = process.env.PORT || 3000;
 // HELPERS
 // ─────────────────────────────────────────────
 
-function getMention(username) {
-  if (!username) return null;
-  const id = REVIEWER_MAP[username.toLowerCase().trim()];
-  return id ? `<@${id}>` : `**@${username}**`; // fallback: nome em negrito
+function getMention(email) {
+  if (!email) return null;
+  const id = REVIEWER_MAP[email.toLowerCase().trim()];
+  return id ? `<@${id}>` : `**${email}**`; // fallback: email em negrito
 }
 
-function extractReviewer(payload) {
-  // O UVCS envia o payload já formatado para o Discord
-  // O revisor aparece em embeds[0].title ou na description como [requested-review-from-EMAIL]
-  const embed = payload.embeds?.[0];
-  if (!embed) return null;
-
-  // Tenta pegar do título do embed
-  const title = embed.title ?? '';
-  if (title.includes('@')) return title.trim();
-
-  // Tenta extrair da description: [requested-review-from-EMAIL]
-  const desc = embed.description ?? '';
-  const match = desc.match(/\[requested-review-from-([^\]]+)\]/);
-  if (match) return match[1].trim();
-
-  return null;
+// Detecta o tipo de evento com base na description do embed
+function detectEvent(desc) {
+  if (desc.includes('requested-review-from')) return 'review_requested';
+  if (desc.includes('[status-reviewed]'))     return 'status_reviewed';
+  if (desc.includes('[status-rework]'))       return 'status_rework';
+  if (desc.includes('Under review'))          return 'under_review';
+  return 'comment'; // qualquer outro texto é tratado como comentário
 }
 
-function buildDiscordEmbed(payload) {
-  const reviewer  = payload.assignee ?? payload.reviewer ?? payload.reviewers?.[0] ?? extractReviewer(payload);
-  const owner     = payload.owner   ?? payload.author    ?? 'desconhecido';
-  const embed     = payload.embeds?.[0];
-  const title     = payload.title   ?? (embed?.title && !embed.title.includes('@') ? embed.title : null) ?? 'Novo Code Review';
-  const repo      = payload.repository ?? payload.repo ?? embed?.footer?.text ?? '';
-  const branch    = payload.branch  ?? '';
+// Extrai dados comuns do payload do UVCS
+function parsePayload(payload) {
+  const embed      = payload.embeds?.[0] ?? {};
+  const desc       = embed.description ?? '';
+  const actor      = embed.title ?? '';        // quem fez a ação
+  const repo       = embed.footer?.text ?? '';
+  const reviewName = payload.content?.match(/review `([^`]+)`/)?.[1] ?? 'Code Review';
+  const eventType  = detectEvent(desc);
 
-  // Extrai a URL plástica da description e converte para link do dashboard
-  const desc      = embed?.description ?? '';
-  const urlMatch  = desc.match(/<(plastic:\/\/[^>]+)>/);
-  const reviewUrl = payload.url ?? payload.reviewUrl ?? (urlMatch ? urlMatch[1] : '') ?? '';
+  // Em review_requested, o email do revisor está na description
+  const reviewerMatch = desc.match(/\[requested-review-from-([^\]]+)\]/);
+  const reviewer = reviewerMatch ? reviewerMatch[1] : null;
 
-  // Extrai o nome do review do content: "New comment to the review `NOME`"
-  const contentMatch = payload.content?.match(/review `([^`]+)`/);
-  const reviewName = contentMatch ? contentMatch[1] : title;
+  return { embed, desc, actor, repo, reviewName, eventType, reviewer };
+}
 
-  const mention = getMention(reviewer);
-  const mentionLine = mention
-      ? `👤 **Revisor:** ${mention}`
-      : '👤 Revisor não identificado';
+// Monta a mensagem do Discord de acordo com o tipo de evento
+function buildMessage(payload) {
+  const { actor, repo, reviewName, eventType, reviewer } = parsePayload(payload);
 
-  const fields = [];
-  if (repo)   fields.push({ name: '📁 Repositório', value: repo,   inline: true });
-  if (branch) fields.push({ name: '🌿 Branch',      value: branch, inline: true });
-  if (owner !== 'desconhecido') fields.push({ name: '✏️ Autor', value: owner, inline: true });
+  const actorMention    = getMention(actor);
+  const reviewerMention = getMention(reviewer ?? actor);
 
-  return {
-    content: mention ? `${mention} você tem um novo Code Review para revisar!` : mentionLine,
-    embeds: [{
-      title: `🔍 ${reviewName}`,
-      color: 0x5865F2,
-      fields,
-      footer: { text: 'Unity Version Control · Code Review' },
-      timestamp: new Date().toISOString(),
-    }],
-  };
+  switch (eventType) {
+
+    case 'review_requested':
+      // Menciona o revisor designado
+      return {
+        content: `${reviewerMention} você foi designado para revisar um Code Review!`,
+        embeds: [{
+          title: `🔍 ${reviewName}`,
+          color: 0x5865F2,
+          fields: [
+            { name: '✏️ Solicitado por', value: actor || 'desconhecido', inline: true },
+            { name: '📁 Repositório',    value: repo  || 'desconhecido', inline: true },
+          ],
+          footer: { text: 'Unity Version Control · Novo Review' },
+          timestamp: new Date().toISOString(),
+        }],
+      };
+
+    case 'status_reviewed':
+      // Menciona o autor do review (actor = quem aprovou)
+      return {
+        content: `${actorMention} marcou o review como **Reviewed** ✅`,
+        embeds: [{
+          title: `✅ ${reviewName}`,
+          color: 0x57F287, // verde
+          fields: [
+            { name: '👤 Revisado por', value: actor || 'desconhecido', inline: true },
+            { name: '📁 Repositório',  value: repo  || 'desconhecido', inline: true },
+          ],
+          footer: { text: 'Unity Version Control · Status Atualizado' },
+          timestamp: new Date().toISOString(),
+        }],
+      };
+
+    case 'status_rework':
+      // Menciona quem pediu o rework
+      return {
+        content: `${actorMention} solicitou **Rework** no review ⚠️`,
+        embeds: [{
+          title: `⚠️ ${reviewName}`,
+          color: 0xFEE75C, // amarelo
+          fields: [
+            { name: '👤 Solicitado por', value: actor || 'desconhecido', inline: true },
+            { name: '📁 Repositório',    value: repo  || 'desconhecido', inline: true },
+          ],
+          footer: { text: 'Unity Version Control · Rework Solicitado' },
+          timestamp: new Date().toISOString(),
+        }],
+      };
+
+    case 'comment':
+      // Menciona quem comentou
+      return {
+        content: `${actorMention} adicionou um comentário no review 💬`,
+        embeds: [{
+          title: `💬 ${reviewName}`,
+          color: 0xEB459E, // rosa
+          fields: [
+            { name: '👤 Comentado por', value: actor || 'desconhecido', inline: true },
+            { name: '📁 Repositório',   value: repo  || 'desconhecido', inline: true },
+          ],
+          footer: { text: 'Unity Version Control · Novo Comentário' },
+          timestamp: new Date().toISOString(),
+        }],
+      };
+
+    default:
+      return null;
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -90,23 +138,22 @@ function buildDiscordEmbed(payload) {
 
 app.post('/uvcs-webhook', async (req, res) => {
   const payload = req.body;
-
   console.log('[UVCS] Payload recebido:', JSON.stringify(payload, null, 2));
 
-  // Filtra apenas eventos de atribuição de revisor
-  // O UVCS indica isso com [requested-review-from-...] na description
-  const desc = payload.embeds?.[0]?.description ?? '';
-  const isReviewRequest = desc.includes('requested-review-from');
-  const eventType = payload.event ?? payload.type ?? '';
-  const isReviewEvent = eventType.toLowerCase().includes('review');
+  // Ignora eventos genéricos de "Under review"
+  const { eventType } = parsePayload(payload);
+  if (eventType === 'under_review') {
+    console.log('[UVCS] Evento "Under review" ignorado');
+    return res.sendStatus(200);
+  }
 
-  if (!isReviewRequest && !isReviewEvent) {
-    console.log('[UVCS] Evento ignorado (não é atribuição de revisor)');
+  const discordBody = buildMessage(payload);
+  if (!discordBody) {
+    console.log('[UVCS] Evento não mapeado, ignorado');
     return res.sendStatus(200);
   }
 
   try {
-    const discordBody = buildDiscordEmbed(payload);
     const response = await fetch(DISCORD_WEBHOOK_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -115,11 +162,11 @@ app.post('/uvcs-webhook', async (req, res) => {
 
     if (!response.ok) {
       const err = await response.text();
-      console.error('[Discord] Erro ao enviar mensagem:', response.status, err);
+      console.error('[Discord] Erro:', response.status, err);
       return res.status(500).json({ error: 'Falha ao enviar para o Discord' });
     }
 
-    console.log('[Discord] Mensagem enviada com sucesso');
+    console.log(`[Discord] Mensagem enviada — evento: ${eventType}`);
     res.sendStatus(200);
   } catch (err) {
     console.error('[Erro]', err);
@@ -128,23 +175,64 @@ app.post('/uvcs-webhook', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// ROTA DE TESTE — simula um Code Review
+// ROTA DE TESTE — simula cada tipo de evento
+// Acesse /test?evento=review_requested
+//         /test?evento=status_reviewed
+//         /test?evento=status_rework
+//         /test?evento=comment
 // ─────────────────────────────────────────────
 
 app.get('/test', async (req, res) => {
-  const fakePayload = {
-    event:      'codereview.created',
-    title:      'Refactor: sistema de inventário',
-    owner:      'joao.silva',
-    assignee:   'nicholaspedroso@outlook.com',
-    repository: 'MeuJogo',
-    branch:     '/main/feature-inventario',
-    url:        'https://dashboard.unity3d.com/devops',
+  const evento = req.query.evento ?? 'review_requested';
+
+  const payloads = {
+    review_requested: {
+      content: "New comment to the review `Dev teste`",
+      embeds: [{
+        color: 15234920,
+        title: 'nicholaspedroso@outlook.com',
+        description: '[requested-review-from-nicholaspedroso@outlook.com]\n <plastic://test>',
+        footer: { text: 'Aulas_19/Shader@4674152027131.unity' },
+      }],
+    },
+    status_reviewed: {
+      content: "New comment to the review `Dev teste`",
+      embeds: [{
+        color: 15234920,
+        title: 'nicholaspedroso@outlook.com',
+        description: '[status-reviewed]\n <plastic://test>',
+        footer: { text: 'Aulas_19/Shader@4674152027131.unity' },
+      }],
+    },
+    status_rework: {
+      content: "New comment to the review `Dev teste`",
+      embeds: [{
+        color: 15234920,
+        title: 'nicholaspedroso@outlook.com',
+        description: '[status-rework]\n <plastic://test>',
+        footer: { text: 'Aulas_19/Shader@4674152027131.unity' },
+      }],
+    },
+    comment: {
+      content: "New comment to the review `Dev teste`",
+      embeds: [{
+        color: 15234920,
+        title: 'nicholaspedroso@outlook.com',
+        description: 'comentário de teste aqui\n <plastic://test>',
+        footer: { text: 'Aulas_19/Shader@4674152027131.unity' },
+      }],
+    },
   };
 
-  console.log('[TEST] Simulando payload:', fakePayload);
+  const payload = payloads[evento];
+  if (!payload) {
+    return res.status(400).json({ error: 'Evento inválido. Use: review_requested | status_reviewed | status_rework | comment' });
+  }
+
+  console.log(`[TEST] Simulando evento: ${evento}`);
+  const discordBody = buildMessage(payload);
+
   try {
-    const discordBody = buildDiscordEmbed(fakePayload);
     const response = await fetch(DISCORD_WEBHOOK_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -156,19 +244,23 @@ app.get('/test', async (req, res) => {
       return res.status(500).json({ discord_error: err });
     }
 
-    res.json({ ok: true, sent: discordBody });
+    res.json({ ok: true, evento, sent: discordBody });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // ─────────────────────────────────────────────
-// ROTA DE HEALTH CHECK
+// HEALTH CHECK
 // ─────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({ status: 'online' }));
 
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
-  console.log(`Teste rápido: http://localhost:${PORT}/test`);
+  console.log(`Testes disponíveis:`);
+  console.log(`  /test?evento=review_requested`);
+  console.log(`  /test?evento=status_reviewed`);
+  console.log(`  /test?evento=status_rework`);
+  console.log(`  /test?evento=comment`);
 });
