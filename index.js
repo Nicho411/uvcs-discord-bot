@@ -6,15 +6,29 @@ app.use(express.json());
 // CONFIGURAÇÕES — edite aqui
 // ─────────────────────────────────────────────
 
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || 'COLE_AQUI_O_WEBHOOK_DO_DISCORD';
+// Mapeamento: nome do repositório → Webhook do canal Discord correspondente
+const REPO_WEBHOOKS = {
+  'Sundried-Art': process.env.DISCORD_WEBHOOK_ART || 'COLE_AQUI_O_WEBHOOK_DO_CANAL_ARTE',
+  'Sundried-Dev': process.env.DISCORD_WEBHOOK_DEV || 'COLE_AQUI_O_WEBHOOK_DO_CANAL_DEV',
+};
+
+// Retorna o webhook correto com base no repositório do payload
+function getWebhookUrl(repo) {
+  for (const [key, url] of Object.entries(REPO_WEBHOOKS)) {
+    if (repo.includes(key)) return url;
+  }
+  return Object.values(REPO_WEBHOOKS)[0]; // fallback: primeiro webhook
+}
 
 // Mapeamento: email exato do UVCS → User ID do Discord
 // Como pegar o User ID: Discord > Configurações > Avançado > Ativar Modo Desenvolvedor
 // Depois clique com botão direito no usuário > "Copiar ID do usuário"
 const REVIEWER_MAP = {
   'nicholaspedroso@outlook.com': '192641612659163137',
-  // adicione mais membros da equipe aqui:
-  // 'outro@email.com': '000000000000000000',
+  'francescolpm@gmail.com':      '884441615886856224',
+  'jefsmed@outlook.com':         '190662247603765249',
+  'filipefiorentini@gmail.com':  '305950346512039938',
+  'cassiolima052000@gmail.com':  '384008601360138240',
 };
 
 const PORT = process.env.PORT || 3000;
@@ -146,7 +160,7 @@ app.post('/uvcs-webhook', async (req, res) => {
   console.log('[UVCS] Payload recebido:', JSON.stringify(payload, null, 2));
 
   // Ignora eventos genéricos de "Under review"
-  const { eventType } = parsePayload(payload);
+  const { eventType, repo } = parsePayload(payload);
   if (eventType === 'under_review') {
     console.log('[UVCS] Evento "Under review" ignorado');
     return res.sendStatus(200);
@@ -159,7 +173,8 @@ app.post('/uvcs-webhook', async (req, res) => {
   }
 
   try {
-    const response = await fetch(DISCORD_WEBHOOK_URL, {
+    const webhookUrl = getWebhookUrl(repo);
+    const response = await fetch(webhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(discordBody),
@@ -235,10 +250,12 @@ app.get('/test', async (req, res) => {
   }
 
   console.log(`[TEST] Simulando evento: ${evento}`);
+  const { repo: testRepo } = parsePayload(payload);
   const discordBody = buildMessage(payload);
 
   try {
-    const response = await fetch(DISCORD_WEBHOOK_URL, {
+    const webhookUrl = getWebhookUrl(testRepo);
+    const response = await fetch(webhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(discordBody),
