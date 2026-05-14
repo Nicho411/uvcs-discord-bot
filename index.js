@@ -1,4 +1,5 @@
 const express = require('express');
+const cron    = require('node-cron');
 const app = express();
 app.use(express.json());
 
@@ -34,6 +35,35 @@ const REVIEWER_MAP = {
 const PORT = process.env.PORT || 3000;
 
 // ─────────────────────────────────────────────
+// LEMBRETE DIÁRIO
+// ─────────────────────────────────────────────
+
+const REMINDER_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_GENERAL || 'COLE_AQUI_O_WEBHOOK_DO_GENERAL';
+
+// Agendamento: segunda a sexta às 17h (horário de Brasília, UTC-3)
+// Cron: minuto hora * * dia-da-semana (1=seg, 5=sex)
+cron.schedule('0 20 * * 1-5', async () => {
+  console.log('[CRON] Enviando lembrete diário...');
+  try {
+    const response = await fetch(REMINDER_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: '@here Lembre-se de lançar suas horas nas tarefas em que trabalhou no dia de hoje! E também subir prints/vídeos nos cards das tarefas no ClickUp!',
+      }),
+    });
+    if (!response.ok) {
+      const err = await response.text();
+      console.error('[CRON] Erro ao enviar lembrete:', err);
+    } else {
+      console.log('[CRON] Lembrete enviado com sucesso!');
+    }
+  } catch (err) {
+    console.error('[CRON] Erro:', err);
+  }
+}, { timezone: 'America/Sao_Paulo' });
+
+// ─────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────
 
@@ -43,22 +73,33 @@ function getMention(email) {
   return id ? `<@${id}>` : `**${email}**`; // fallback: email em negrito
 }
 
-// Detecta o tipo de evento — suporta payload PLASTIC_* (servidor real) e embeds (teste)
+// Detecta o tipo de evento
 function detectEvent(payload) {
-  // Payload estruturado do servidor real
-  if (payload.PLASTIC_REVIEW_ACTION !== undefined) {
-    const action      = payload.PLASTIC_REVIEW_ACTION ?? '';
-    const commentAct  = payload.PLASTIC_REVIEW_COMMENT_ACTION ?? '';
-    const status      = payload.PLASTIC_REVIEW_STATUS ?? '';
+  if (!payload.PLASTIC_REVIEW_ACTION !== undefined && payload.PLASTIC_REVIEW_ACTION !== undefined) {
+    const action     = payload.PLASTIC_REVIEW_ACTION      ?? '';
+    const comment    = payload.PLASTIC_REVIEW_COMMENT     ?? '';
+    const commentAct = payload.PLASTIC_REVIEW_COMMENT_ACTION ?? '';
 
-    if (action.includes('ReviewerAssigned') || action.includes('Assigned')) return 'review_requested';
-    if (action.includes('Reviewed') || status === 'Reviewed')               return 'status_reviewed';
-    if (action.includes('Rework')   || status === 'Rework required')        return 'status_rework';
-    if (commentAct === 'Created' && payload.PLASTIC_REVIEW_COMMENT)         return 'comment';
-    return 'under_review';
+    // Ignora comentários automáticos de status (ex: [status-reviewed]) — já tratados pelo evento "update reviewer"
+    if (commentAct === 'Created' && (comment.includes('[status-') || comment.includes('[requested-review-from'))) {
+      return 'ignore';
+    }
+
+    if (action === 'update reviewer') {
+      // Verifica se algum revisor mudou para Reviewed ou Rework
+      const info = payload.PLASTIC_REVIEW_ACTION_INFO ?? '';
+      if (info.includes(':Reviewed'))       return 'status_reviewed';
+      if (info.includes(':Rework'))         return 'status_rework';
+      return 'ignore';
+    }
+
+    if (action.includes('Assigned') || action.includes('ReviewerAssigned')) return 'review_requested';
+    if (action === 'create')                return 'review_requested';
+    if (commentAct === 'Created' && comment && !comment.startsWith('[')) return 'comment';
+    return 'ignore';
   }
 
-  // Payload legado via embeds (usado nos testes /test)
+  // Payload legado via embeds (testes /test)
   const desc = payload.embeds?.[0]?.description ?? '';
   if (desc.includes('requested-review-from')) return 'review_requested';
   if (desc.includes('[status-reviewed]'))     return 'status_reviewed';
@@ -67,57 +108,70 @@ function detectEvent(payload) {
   return 'comment';
 }
 
-// Extrai dados comuns do payload — suporta ambos os formatos
+// Extrai dados comuns do payload
 function parsePayload(payload) {
-  // Payload estruturado do servidor real (campos PLASTIC_*)
   if (payload.PLASTIC_REVIEW_ACTION !== undefined) {
+    // Quem mudou o status está no ACTION_INFO (ex: "jefsmed@outlook.com:Reviewed")
+    const actionInfo   = payload.PLASTIC_REVIEW_ACTION_INFO ?? '';
+    const actionActor  = actionInfo.includes(':') ? actionInfo.split(':')[0] : (payload.PLASTIC_USER ?? '');
+
     return {
-      actor:      payload.PLASTIC_REVIEW_OWNER    ?? payload.PLASTIC_USER ?? '',
-      repo:       payload.PLASTIC_REPOSITORY_NAME ?? '',
-      reviewName: payload.PLASTIC_REVIEW_TITLE    ?? 'Code Review',
-      eventType:  detectEvent(payload),
-      reviewer:   payload.PLASTIC_REVIEW_ASSIGNEE ?? null,
-      comment:    payload.PLASTIC_REVIEW_COMMENT  ?? null,
-      branch:     payload.PLASTIC_REVIEW_TARGET   ?? '',
-      actionActor: payload.PLASTIC_USER           ?? '',  // quem disparou o evento
+      actor:       payload.PLASTIC_REVIEW_OWNER    ?? '',   // dono do review
+      actionActor: payload.PLASTIC_USER            ?? '',   // quem executou a ação
+      statusActor: actionActor,                             // quem mudou o status
+      repo:        payload.PLASTIC_REPOSITORY_NAME ?? '',
+      reviewName:  payload.PLASTIC_REVIEW_TITLE    ?? 'Code Review',
+      eventType:   detectEvent(payload),
+      reviewer:    payload.PLASTIC_REVIEW_ASSIGNEE ?? null,
+      comment:     payload.PLASTIC_REVIEW_COMMENT  ?? null,
+      branch:      payload.PLASTIC_REVIEW_TARGET   ?? '',
+      newStatus:   actionInfo.includes(':') ? actionInfo.split(':')[1] : '',
     };
   }
 
   // Payload legado via embeds (testes)
-  const embed  = payload.embeds?.[0] ?? {};
-  const desc   = embed.description ?? '';
+  const embed = payload.embeds?.[0] ?? {};
+  const desc  = embed.description ?? '';
   const reviewerMatch = desc.match(/\[requested-review-from-([^\]]+)\]/);
   return {
-    actor:      embed.title ?? '',
-    repo:       embed.footer?.text ?? '',
-    reviewName: payload.content?.match(/review `([^`]+)`/)?.[1] ?? 'Code Review',
-    eventType:  detectEvent(payload),
-    reviewer:   reviewerMatch ? reviewerMatch[1] : null,
-    comment:    desc.replace(/<plastic:\/\/[^>]+>/g, '').replace(/\[.*?\]/g, '').trim() || null,
-    branch:     '',
+    actor:       embed.title ?? '',
     actionActor: embed.title ?? '',
+    statusActor: embed.title ?? '',
+    repo:        embed.footer?.text ?? '',
+    reviewName:  payload.content?.match(/review `([^`]+)`/)?.[1] ?? 'Code Review',
+    eventType:   detectEvent(payload),
+    reviewer:    reviewerMatch ? reviewerMatch[1] : null,
+    comment:     desc.replace(/<plastic:\/\/[^>]+>/g, '').replace(/\[.*?\]/g, '').trim() || null,
+    branch:      '',
+    newStatus:   '',
   };
 }
 
 // Monta a mensagem do Discord de acordo com o tipo de evento
 function buildMessage(payload) {
-  const { actor, repo, reviewName, eventType, reviewer, comment, branch, actionActor } = parsePayload(payload);
+  const { actor, actionActor, statusActor, repo, reviewName, eventType, reviewer, comment, newStatus } = parsePayload(payload);
 
-  const actorMention    = getMention(actionActor || actor);
-  const reviewerMention = getMention(reviewer ?? actor);
+  const ownerMention    = getMention(actor);        // dono do review
+  const reviewerMention = getMention(reviewer);     // revisor designado
+  const statusMention   = getMention(statusActor);  // quem mudou o status
+
+  // Label legível do status
+  const statusLabel = newStatus.toLowerCase().includes('review') ? 'Reviewed ✅'
+      : newStatus.toLowerCase().includes('rework')  ? 'Rework Required ⚠️'
+          : newStatus;
 
   switch (eventType) {
 
     case 'review_requested':
-      // Menciona o revisor designado
       return {
-        content: `${reviewerMention} você foi designado para revisar um Code Review!`,
+        content: `${ownerMention} abriu um novo review para ${reviewerMention}`,
         embeds: [{
           title: `🔍 ${reviewName}`,
           color: 0x5865F2,
           fields: [
-            { name: '✏️ Solicitado por', value: actor || 'desconhecido', inline: true },
-            { name: '📁 Repositório',    value: repo  || 'desconhecido', inline: true },
+            { name: '✏️ Autor',       value: actor    || 'desconhecido', inline: true },
+            { name: '👤 Revisor',     value: reviewer || 'desconhecido', inline: true },
+            { name: '📁 Repositório', value: repo     || 'desconhecido', inline: true },
           ],
           footer: { text: 'Unity Version Control · Novo Review' },
           timestamp: new Date().toISOString(),
@@ -125,47 +179,33 @@ function buildMessage(payload) {
       };
 
     case 'status_reviewed':
-      // Menciona o autor do review (actor = quem aprovou)
+    case 'status_rework': {
+      const color = eventType === 'status_reviewed' ? 0x57F287 : 0xFEE75C;
       return {
-        content: `${actorMention} marcou o review como **Reviewed** ✅`,
+        content: `${ownerMention} sua solicitação de review teve o status alterado para **${statusLabel}** por ${statusMention}`,
         embeds: [{
-          title: `✅ ${reviewName}`,
-          color: 0x57F287, // verde
+          title: `${eventType === 'status_reviewed' ? '✅' : '⚠️'} ${reviewName}`,
+          color,
           fields: [
-            { name: '👤 Revisado por', value: actionActor || actor || 'desconhecido', inline: true },
-            { name: '📁 Repositório',  value: repo  || 'desconhecido', inline: true },
+            { name: '👤 Alterado por', value: statusActor || 'desconhecido', inline: true },
+            { name: '📁 Repositório',  value: repo        || 'desconhecido', inline: true },
           ],
           footer: { text: 'Unity Version Control · Status Atualizado' },
           timestamp: new Date().toISOString(),
         }],
       };
-
-    case 'status_rework':
-      // Menciona quem pediu o rework
-      return {
-        content: `${actorMention} solicitou **Rework** no review ⚠️`,
-        embeds: [{
-          title: `⚠️ ${reviewName}`,
-          color: 0xFEE75C, // amarelo
-          fields: [
-            { name: '👤 Solicitado por', value: actionActor || actor || 'desconhecido', inline: true },
-            { name: '📁 Repositório',    value: repo  || 'desconhecido', inline: true },
-          ],
-          footer: { text: 'Unity Version Control · Rework Solicitado' },
-          timestamp: new Date().toISOString(),
-        }],
-      };
+    }
 
     case 'comment':
       return {
-        content: `${actorMention} adicionou um comentário no review 💬`,
+        content: `${getMention(actionActor)} adicionou um comentário no review 💬`,
         embeds: [{
           title: `💬 ${reviewName}`,
-          color: 0xEB459E, // rosa
+          color: 0xEB459E,
           description: comment ?? undefined,
           fields: [
-            { name: '👤 Comentado por', value: actionActor || actor || 'desconhecido', inline: true },
-            { name: '📁 Repositório',   value: repo  || 'desconhecido', inline: true },
+            { name: '👤 Comentado por', value: actionActor || 'desconhecido', inline: true },
+            { name: '📁 Repositório',   value: repo        || 'desconhecido', inline: true },
           ],
           footer: { text: 'Unity Version Control · Novo Comentário' },
           timestamp: new Date().toISOString(),
@@ -185,10 +225,9 @@ app.post('/uvcs-webhook', async (req, res) => {
   const payload = req.body;
   console.log('[UVCS] Payload recebido:', JSON.stringify(payload, null, 2));
 
-  // Ignora eventos genéricos de "Under review"
   const { eventType, repo } = parsePayload(payload);
-  if (eventType === 'under_review') {
-    console.log('[UVCS] Evento "Under review" ignorado');
+  if (eventType === 'ignore' || eventType === 'under_review') {
+    console.log('[UVCS] Evento ignorado:', eventType);
     return res.sendStatus(200);
   }
 
