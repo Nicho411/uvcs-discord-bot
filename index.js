@@ -75,27 +75,34 @@ function getMention(email) {
 
 // Detecta o tipo de evento
 function detectEvent(payload) {
-  if (!payload.PLASTIC_REVIEW_ACTION !== undefined && payload.PLASTIC_REVIEW_ACTION !== undefined) {
-    const action     = payload.PLASTIC_REVIEW_ACTION      ?? '';
-    const comment    = payload.PLASTIC_REVIEW_COMMENT     ?? '';
+  if (payload.PLASTIC_REVIEW_ACTION !== undefined) {
+    const action     = payload.PLASTIC_REVIEW_ACTION         ?? '';
+    const comment    = payload.PLASTIC_REVIEW_COMMENT        ?? '';
     const commentAct = payload.PLASTIC_REVIEW_COMMENT_ACTION ?? '';
+    const info       = payload.PLASTIC_REVIEW_ACTION_INFO    ?? '';
 
-    // Ignora comentários automáticos de status (ex: [status-reviewed]) — já tratados pelo evento "update reviewer"
-    if (commentAct === 'Created' && (comment.includes('[status-') || comment.includes('[requested-review-from'))) {
-      return 'ignore';
+    // Abertura de review: action "add reviewer" OU comment [requested-review-from-...]
+    if (action === 'add reviewer' || comment.includes('[requested-review-from')) {
+      return 'review_requested';
     }
 
+    // Mudança de status via "update reviewer"
     if (action === 'update reviewer') {
-      // Verifica se algum revisor mudou para Reviewed ou Rework
-      const info = payload.PLASTIC_REVIEW_ACTION_INFO ?? '';
-      if (info.includes(':Reviewed'))       return 'status_reviewed';
-      if (info.includes(':Rework'))         return 'status_rework';
+      if (info.includes(':Reviewed'))   return 'status_reviewed';
+      if (info.includes(':Rework'))     return 'status_rework';
       return 'ignore';
     }
 
-    if (action.includes('Assigned') || action.includes('ReviewerAssigned')) return 'review_requested';
-    if (action === 'create')                return 'review_requested';
-    if (commentAct === 'Created' && comment && !comment.startsWith('[')) return 'comment';
+    // Comentário automático de status — ignorar (duplicata do update reviewer)
+    if (commentAct === 'Created' && comment.startsWith('[status-')) {
+      return 'ignore';
+    }
+
+    // Comentário real
+    if (commentAct === 'Created' && comment && !comment.startsWith('[')) {
+      return 'comment';
+    }
+
     return 'ignore';
   }
 
@@ -115,15 +122,23 @@ function parsePayload(payload) {
     const actionInfo   = payload.PLASTIC_REVIEW_ACTION_INFO ?? '';
     const actionActor  = actionInfo.includes(':') ? actionInfo.split(':')[0] : (payload.PLASTIC_USER ?? '');
 
+    // Revisor: no "add reviewer" está no ACTION_INFO, senão no ASSIGNEE ou extraído do comment
+    const commentText = payload.PLASTIC_REVIEW_COMMENT ?? '';
+    const reviewerFromComment = commentText.match(/\[requested-review-from-([^\]]+)\]/)?.[1] ?? null;
+    const reviewer = reviewerFromComment
+        ?? (actionInfo && !actionInfo.includes(':') ? actionInfo : null)
+        ?? payload.PLASTIC_REVIEW_ASSIGNEE
+        ?? null;
+
     return {
-      actor:       payload.PLASTIC_REVIEW_OWNER    ?? '',   // dono do review
-      actionActor: payload.PLASTIC_USER            ?? '',   // quem executou a ação
-      statusActor: actionActor,                             // quem mudou o status
+      actor:       payload.PLASTIC_REVIEW_OWNER    ?? '',
+      actionActor: payload.PLASTIC_USER            ?? '',
+      statusActor: actionActor,
       repo:        payload.PLASTIC_REPOSITORY_NAME ?? '',
       reviewName:  payload.PLASTIC_REVIEW_TITLE    ?? 'Code Review',
       eventType:   detectEvent(payload),
-      reviewer:    payload.PLASTIC_REVIEW_ASSIGNEE ?? null,
-      comment:     payload.PLASTIC_REVIEW_COMMENT  ?? null,
+      reviewer,
+      comment:     (!commentText.startsWith('[') ? commentText : null),
       branch:      payload.PLASTIC_REVIEW_TARGET   ?? '',
       newStatus:   actionInfo.includes(':') ? actionInfo.split(':')[1] : '',
     };
