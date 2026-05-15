@@ -42,7 +42,7 @@ const REMINDER_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_GENERAL || 'COLE_AQUI_O
 
 // Agendamento: segunda a sexta às 17h (horário de Brasília, UTC-3)
 // Cron: minuto hora * * dia-da-semana (1=seg, 5=sex)
-cron.schedule('0 20 * * 1-5', async () => {
+cron.schedule('0 17 * * 1-5', async () => {
   console.log('[CRON] Enviando lembrete diário...');
   try {
     const response = await fetch(REMINDER_WEBHOOK_URL, {
