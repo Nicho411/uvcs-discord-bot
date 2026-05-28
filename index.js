@@ -7,27 +7,34 @@ app.use(express.json());
 // CONFIGURAÇÕES — edite aqui
 // ─────────────────────────────────────────────
 
-// Mapeamento: nome do repositório → Webhook do canal Discord correspondente
 const REPO_WEBHOOKS = {
   'Sundried-Art': process.env.DISCORD_WEBHOOK_ART || 'COLE_AQUI_O_WEBHOOK_DO_CANAL_ARTE',
   'Sundried-Dev': process.env.DISCORD_WEBHOOK_DEV || 'COLE_AQUI_O_WEBHOOK_DO_CANAL_DEV',
 };
 
-// Retorna o webhook correto com base no repositório do payload
 function getWebhookUrl(repo) {
   for (const [key, url] of Object.entries(REPO_WEBHOOKS)) {
     if (repo.includes(key)) return url;
   }
-  return Object.values(REPO_WEBHOOKS)[0]; // fallback: primeiro webhook
+  return Object.values(REPO_WEBHOOKS)[0];
 }
 
-// Mapeamento: email exato do UVCS → User ID do Discord
 const REVIEWER_MAP = {
   'nicholaspedroso@outlook.com': '192641612659163137',
   'francescolpm@gmail.com':      '884441615886856224',
   'jefsmed@outlook.com':         '190662247603765249',
   'filipefiorentini@gmail.com':  '305950346512039938',
   'cassiolima052000@gmail.com':  '384008601360138240',
+};
+
+const CLICKUP_TOKEN   = process.env.CLICKUP_TOKEN   || '';
+const CLICKUP_TEAM_ID = process.env.CLICKUP_TEAM_ID || '';
+
+// Mapeamento: evento → status no ClickUp
+const CLICKUP_STATUS = {
+  review_requested: 'IN REVIEW',
+  status_reviewed:  'ACCEPTED',
+  status_rework:    'REJECTED',
 };
 
 const PORT = process.env.PORT || 3000;
@@ -40,9 +47,7 @@ const REMINDER_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_GENERAL || 'COLE_AQUI_O
 
 let ultimoLembrete = null;
 
-// Segunda a sexta às 17h (horário de Brasília)
 cron.schedule('0 17 * * 1-5', async () => {
-  // Evita disparo duplicado quando Railway roda múltiplas instâncias no redeploy
   const hoje = new Date().toISOString().slice(0, 10);
   if (ultimoLembrete === hoje) {
     console.log('[CRON] Lembrete já enviado hoje, ignorando duplicata');
@@ -60,8 +65,7 @@ cron.schedule('0 17 * * 1-5', async () => {
       }),
     });
     if (!response.ok) {
-      const err = await response.text();
-      console.error('[CRON] Erro ao enviar lembrete:', err);
+      console.error('[CRON] Erro ao enviar lembrete:', await response.text());
     } else {
       console.log('[CRON] Lembrete enviado com sucesso!');
     }
@@ -69,6 +73,87 @@ cron.schedule('0 17 * * 1-5', async () => {
     console.error('[CRON] Erro:', err);
   }
 }, { timezone: 'America/Sao_Paulo' });
+
+// ─────────────────────────────────────────────
+// CLICKUP
+// ─────────────────────────────────────────────
+
+// Extrai o custom ID da task do título do review (ex: "Dev [SD-391]: ..." → "SD-391")
+function extractTaskId(reviewTitle) {
+  const match = reviewTitle.match(/\[([A-Z]+-\d+)\]/);
+  return match ? match[1] : null;
+}
+
+// Busca a task pelo custom ID e retorna o task ID interno do ClickUp
+async function findTaskByCustomId(customId) {
+  if (!CLICKUP_TOKEN || !CLICKUP_TEAM_ID) return null;
+
+  try {
+    const url = `https://api.clickup.com/api/v2/team/${CLICKUP_TEAM_ID}/task?custom_task_ids=true&custom_id=${customId}`;
+    const res = await fetch(url, {
+      headers: { Authorization: CLICKUP_TOKEN },
+    });
+
+    if (!res.ok) {
+      console.error('[ClickUp] Erro ao buscar task:', res.status, await res.text());
+      return null;
+    }
+
+    const data = await res.json();
+    const task = data.tasks?.[0];
+    if (!task) {
+      console.warn(`[ClickUp] Task não encontrada para custom ID: ${customId}`);
+      return null;
+    }
+
+    return task.id;
+  } catch (err) {
+    console.error('[ClickUp] Erro na busca:', err);
+    return null;
+  }
+}
+
+// Atualiza o status da task no ClickUp
+async function updateTaskStatus(taskId, status) {
+  if (!CLICKUP_TOKEN) return;
+
+  try {
+    const res = await fetch(`https://api.clickup.com/api/v2/task/${taskId}`, {
+      method: 'PUT',
+      headers: {
+        Authorization: CLICKUP_TOKEN,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ status }),
+    });
+
+    if (!res.ok) {
+      console.error('[ClickUp] Erro ao atualizar status:', res.status, await res.text());
+    } else {
+      console.log(`[ClickUp] Status atualizado para "${status}" na task ${taskId}`);
+    }
+  } catch (err) {
+    console.error('[ClickUp] Erro ao atualizar:', err);
+  }
+}
+
+// Orquestra a busca e atualização pelo título do review
+async function syncClickUp(reviewTitle, eventType) {
+  const newStatus = CLICKUP_STATUS[eventType];
+  if (!newStatus) return;
+
+  const customId = extractTaskId(reviewTitle);
+  if (!customId) {
+    console.warn(`[ClickUp] Nenhum ID de task encontrado no título: "${reviewTitle}"`);
+    return;
+  }
+
+  console.log(`[ClickUp] Buscando task ${customId}...`);
+  const taskId = await findTaskByCustomId(customId);
+  if (!taskId) return;
+
+  await updateTaskStatus(taskId, newStatus);
+}
 
 // ─────────────────────────────────────────────
 // HELPERS
@@ -90,25 +175,16 @@ function detectEvent(payload) {
     if (action === 'add reviewer' || comment.includes('[requested-review-from')) {
       return 'review_requested';
     }
-
     if (action === 'update reviewer') {
       if (info.includes(':Reviewed')) return 'status_reviewed';
       if (info.includes(':Rework'))   return 'status_rework';
       return 'ignore';
     }
-
-    if (commentAct === 'Created' && comment.startsWith('[status-')) {
-      return 'ignore';
-    }
-
-    if (commentAct === 'Created' && comment && !comment.startsWith('[')) {
-      return 'comment';
-    }
-
+    if (commentAct === 'Created' && comment.startsWith('[status-')) return 'ignore';
+    if (commentAct === 'Created' && comment && !comment.startsWith('[')) return 'comment';
     return 'ignore';
   }
 
-  // Payload legado via embeds (não usado em produção)
   const desc = payload.embeds?.[0]?.description ?? '';
   if (desc.includes('requested-review-from')) return 'review_requested';
   if (desc.includes('[status-reviewed]'))     return 'status_reviewed';
@@ -235,7 +311,7 @@ app.post('/uvcs-webhook', async (req, res) => {
   const payload = req.body;
   console.log('[UVCS] Payload recebido:', JSON.stringify(payload, null, 2));
 
-  const { eventType, repo } = parsePayload(payload);
+  const { eventType, repo, reviewName } = parsePayload(payload);
   if (eventType === 'ignore' || eventType === 'under_review') {
     console.log('[UVCS] Evento ignorado:', eventType);
     return res.sendStatus(200);
@@ -247,26 +323,25 @@ app.post('/uvcs-webhook', async (req, res) => {
     return res.sendStatus(200);
   }
 
-  try {
-    const webhookUrl = getWebhookUrl(repo);
-    const response = await fetch(webhookUrl, {
+  // Dispara Discord e ClickUp em paralelo
+  await Promise.allSettled([
+    // Discord
+    fetch(getWebhookUrl(repo), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(discordBody),
-    });
+    }).then(async r => {
+      if (!r.ok) console.error('[Discord] Erro:', r.status, await r.text());
+      else console.log(`[Discord] Mensagem enviada — evento: ${eventType}`);
+    }),
 
-    if (!response.ok) {
-      const err = await response.text();
-      console.error('[Discord] Erro:', response.status, err);
-      return res.status(500).json({ error: 'Falha ao enviar para o Discord' });
-    }
+    // ClickUp (só para eventos que alteram status)
+    ['review_requested', 'status_reviewed', 'status_rework'].includes(eventType)
+        ? syncClickUp(reviewName, eventType)
+        : Promise.resolve(),
+  ]);
 
-    console.log(`[Discord] Mensagem enviada — evento: ${eventType}`);
-    res.sendStatus(200);
-  } catch (err) {
-    console.error('[Erro]', err);
-    res.status(500).json({ error: err.message });
-  }
+  res.sendStatus(200);
 });
 
 // ─────────────────────────────────────────────
