@@ -22,8 +22,6 @@ function getWebhookUrl(repo) {
 }
 
 // Mapeamento: email exato do UVCS → User ID do Discord
-// Como pegar o User ID: Discord > Configurações > Avançado > Ativar Modo Desenvolvedor
-// Depois clique com botão direito no usuário > "Copiar ID do usuário"
 const REVIEWER_MAP = {
   'nicholaspedroso@outlook.com': '192641612659163137',
   'francescolpm@gmail.com':      '884441615886856224',
@@ -40,9 +38,18 @@ const PORT = process.env.PORT || 3000;
 
 const REMINDER_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_GENERAL || 'COLE_AQUI_O_WEBHOOK_DO_GENERAL';
 
-// Agendamento: segunda a sexta às 17h (horário de Brasília, UTC-3)
-// Cron: minuto hora * * dia-da-semana (1=seg, 5=sex)
+let ultimoLembrete = null;
+
+// Segunda a sexta às 17h (horário de Brasília)
 cron.schedule('0 17 * * 1-5', async () => {
+  // Evita disparo duplicado quando Railway roda múltiplas instâncias no redeploy
+  const hoje = new Date().toISOString().slice(0, 10);
+  if (ultimoLembrete === hoje) {
+    console.log('[CRON] Lembrete já enviado hoje, ignorando duplicata');
+    return;
+  }
+  ultimoLembrete = hoje;
+
   console.log('[CRON] Enviando lembrete diário...');
   try {
     const response = await fetch(REMINDER_WEBHOOK_URL, {
@@ -70,10 +77,9 @@ cron.schedule('0 17 * * 1-5', async () => {
 function getMention(email) {
   if (!email) return null;
   const id = REVIEWER_MAP[email.toLowerCase().trim()];
-  return id ? `<@${id}>` : `**${email}**`; // fallback: email em negrito
+  return id ? `<@${id}>` : `**${email}**`;
 }
 
-// Detecta o tipo de evento
 function detectEvent(payload) {
   if (payload.PLASTIC_REVIEW_ACTION !== undefined) {
     const action     = payload.PLASTIC_REVIEW_ACTION         ?? '';
@@ -81,24 +87,20 @@ function detectEvent(payload) {
     const commentAct = payload.PLASTIC_REVIEW_COMMENT_ACTION ?? '';
     const info       = payload.PLASTIC_REVIEW_ACTION_INFO    ?? '';
 
-    // Abertura de review: action "add reviewer" OU comment [requested-review-from-...]
     if (action === 'add reviewer' || comment.includes('[requested-review-from')) {
       return 'review_requested';
     }
 
-    // Mudança de status via "update reviewer"
     if (action === 'update reviewer') {
-      if (info.includes(':Reviewed'))   return 'status_reviewed';
-      if (info.includes(':Rework'))     return 'status_rework';
+      if (info.includes(':Reviewed')) return 'status_reviewed';
+      if (info.includes(':Rework'))   return 'status_rework';
       return 'ignore';
     }
 
-    // Comentário automático de status — ignorar (duplicata do update reviewer)
     if (commentAct === 'Created' && comment.startsWith('[status-')) {
       return 'ignore';
     }
 
-    // Comentário real
     if (commentAct === 'Created' && comment && !comment.startsWith('[')) {
       return 'comment';
     }
@@ -106,7 +108,7 @@ function detectEvent(payload) {
     return 'ignore';
   }
 
-  // Payload legado via embeds (testes /test)
+  // Payload legado via embeds (não usado em produção)
   const desc = payload.embeds?.[0]?.description ?? '';
   if (desc.includes('requested-review-from')) return 'review_requested';
   if (desc.includes('[status-reviewed]'))     return 'status_reviewed';
@@ -115,14 +117,10 @@ function detectEvent(payload) {
   return 'comment';
 }
 
-// Extrai dados comuns do payload
 function parsePayload(payload) {
   if (payload.PLASTIC_REVIEW_ACTION !== undefined) {
-    // Quem mudou o status está no ACTION_INFO (ex: "jefsmed@outlook.com:Reviewed")
-    const actionInfo   = payload.PLASTIC_REVIEW_ACTION_INFO ?? '';
-    const actionActor  = actionInfo.includes(':') ? actionInfo.split(':')[0] : (payload.PLASTIC_USER ?? '');
-
-    // Revisor: no "add reviewer" está no ACTION_INFO, senão no ASSIGNEE ou extraído do comment
+    const actionInfo  = payload.PLASTIC_REVIEW_ACTION_INFO ?? '';
+    const actionActor = actionInfo.includes(':') ? actionInfo.split(':')[0] : (payload.PLASTIC_USER ?? '');
     const commentText = payload.PLASTIC_REVIEW_COMMENT ?? '';
     const reviewerFromComment = commentText.match(/\[requested-review-from-([^\]]+)\]/)?.[1] ?? null;
     const reviewer = reviewerFromComment
@@ -144,7 +142,6 @@ function parsePayload(payload) {
     };
   }
 
-  // Payload legado via embeds (testes)
   const embed = payload.embeds?.[0] ?? {};
   const desc  = embed.description ?? '';
   const reviewerMatch = desc.match(/\[requested-review-from-([^\]]+)\]/);
@@ -162,15 +159,13 @@ function parsePayload(payload) {
   };
 }
 
-// Monta a mensagem do Discord de acordo com o tipo de evento
 function buildMessage(payload) {
   const { actor, actionActor, statusActor, repo, reviewName, eventType, reviewer, comment, newStatus } = parsePayload(payload);
 
-  const ownerMention    = getMention(actor);        // dono do review
-  const reviewerMention = getMention(reviewer);     // revisor designado
-  const statusMention   = getMention(statusActor);  // quem mudou o status
+  const ownerMention    = getMention(actor);
+  const reviewerMention = getMention(reviewer);
+  const statusMention   = getMention(statusActor);
 
-  // Label legível do status
   const statusLabel = newStatus.toLowerCase().includes('review') ? 'Reviewed ✅'
       : newStatus.toLowerCase().includes('rework')  ? 'Rework Required ⚠️'
           : newStatus;
@@ -275,84 +270,6 @@ app.post('/uvcs-webhook', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// ROTA DE TESTE — simula cada tipo de evento
-// Acesse /test?evento=review_requested
-//         /test?evento=status_reviewed
-//         /test?evento=status_rework
-//         /test?evento=comment
-// ─────────────────────────────────────────────
-
-app.get('/test', async (req, res) => {
-  const evento = req.query.evento ?? 'review_requested';
-
-  const payloads = {
-    review_requested: {
-      content: "New comment to the review `Dev teste`",
-      embeds: [{
-        color: 15234920,
-        title: 'nicholaspedroso@outlook.com',
-        description: '[requested-review-from-nicholaspedroso@outlook.com]\n <plastic://test>',
-        footer: { text: 'Aulas_19/Shader@4674152027131.unity' },
-      }],
-    },
-    status_reviewed: {
-      content: "New comment to the review `Dev teste`",
-      embeds: [{
-        color: 15234920,
-        title: 'nicholaspedroso@outlook.com',
-        description: '[status-reviewed]\n <plastic://test>',
-        footer: { text: 'Aulas_19/Shader@4674152027131.unity' },
-      }],
-    },
-    status_rework: {
-      content: "New comment to the review `Dev teste`",
-      embeds: [{
-        color: 15234920,
-        title: 'nicholaspedroso@outlook.com',
-        description: '[status-rework]\n <plastic://test>',
-        footer: { text: 'Aulas_19/Shader@4674152027131.unity' },
-      }],
-    },
-    comment: {
-      content: "New comment to the review `Dev teste`",
-      embeds: [{
-        color: 15234920,
-        title: 'nicholaspedroso@outlook.com',
-        description: 'comentário de teste aqui\n <plastic://test>',
-        footer: { text: 'Aulas_19/Shader@4674152027131.unity' },
-      }],
-    },
-  };
-
-  const payload = payloads[evento];
-  if (!payload) {
-    return res.status(400).json({ error: 'Evento inválido. Use: review_requested | status_reviewed | status_rework | comment' });
-  }
-
-  console.log(`[TEST] Simulando evento: ${evento}`);
-  const { repo: testRepo } = parsePayload(payload);
-  const discordBody = buildMessage(payload);
-
-  try {
-    const webhookUrl = getWebhookUrl(testRepo);
-    const response = await fetch(webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(discordBody),
-    });
-
-    if (!response.ok) {
-      const err = await response.text();
-      return res.status(500).json({ discord_error: err });
-    }
-
-    res.json({ ok: true, evento, sent: discordBody });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─────────────────────────────────────────────
 // HEALTH CHECK
 // ─────────────────────────────────────────────
 
@@ -360,9 +277,4 @@ app.get('/', (req, res) => res.json({ status: 'online' }));
 
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
-  console.log(`Testes disponíveis:`);
-  console.log(`  /test?evento=review_requested`);
-  console.log(`  /test?evento=status_reviewed`);
-  console.log(`  /test?evento=status_rework`);
-  console.log(`  /test?evento=comment`);
 });
