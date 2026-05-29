@@ -4,12 +4,12 @@ const app = express();
 app.use(express.json());
 
 // ─────────────────────────────────────────────
-// CONFIGURAÇÕES — edite aqui
+// CONFIGURAÇÕES
 // ─────────────────────────────────────────────
 
 const REPO_WEBHOOKS = {
-  'Sundried-Art': process.env.DISCORD_WEBHOOK_ART || 'COLE_AQUI_O_WEBHOOK_DO_CANAL_ARTE',
-  'Sundried-Dev': process.env.DISCORD_WEBHOOK_DEV || 'COLE_AQUI_O_WEBHOOK_DO_CANAL_DEV',
+  'Sundried-Art': process.env.DISCORD_WEBHOOK_ART || '',
+  'Sundried-Dev': process.env.DISCORD_WEBHOOK_DEV || '',
 };
 
 function getWebhookUrl(repo) {
@@ -30,21 +30,40 @@ const REVIEWER_MAP = {
 const CLICKUP_TOKEN   = process.env.CLICKUP_TOKEN   || '';
 const CLICKUP_TEAM_ID = process.env.CLICKUP_TEAM_ID || '';
 
-// Mapeamento: evento → status no ClickUp
 const CLICKUP_STATUS = {
   review_requested: 'IN REVIEW',
   status_reviewed:  'ACCEPTED',
   status_rework:    'REJECTED',
+  review_closed:    'COMPLETE',
 };
 
 const PORT = process.env.PORT || 3000;
 
 // ─────────────────────────────────────────────
+// DEDUP — evita processar o mesmo evento duas vezes
+// O UVCS dispara "add reviewer" + "[requested-review-from-EMAIL]" para o mesmo revisor
+// ─────────────────────────────────────────────
+
+const recentEvents = new Map();
+
+function isDuplicate(key) {
+  const now = Date.now();
+  if (recentEvents.has(key) && now - recentEvents.get(key) < 10000) {
+    return true; // mesmo evento nos últimos 10 segundos
+  }
+  recentEvents.set(key, now);
+  // Limpa entradas antigas para não acumular memória
+  for (const [k, t] of recentEvents.entries()) {
+    if (now - t > 60000) recentEvents.delete(k);
+  }
+  return false;
+}
+
+// ─────────────────────────────────────────────
 // LEMBRETE DIÁRIO
 // ─────────────────────────────────────────────
 
-const REMINDER_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_GENERAL || 'COLE_AQUI_O_WEBHOOK_DO_GENERAL';
-
+const REMINDER_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_GENERAL || '';
 let ultimoLembrete = null;
 
 cron.schedule('0 17 * * 1-5', async () => {
@@ -54,7 +73,6 @@ cron.schedule('0 17 * * 1-5', async () => {
     return;
   }
   ultimoLembrete = hoje;
-
   console.log('[CRON] Enviando lembrete diário...');
   try {
     const response = await fetch(REMINDER_WEBHOOK_URL, {
@@ -64,11 +82,8 @@ cron.schedule('0 17 * * 1-5', async () => {
         content: '@here Lembre-se de lançar suas horas nas tarefas em que trabalhou no dia de hoje! E também subir prints/vídeos nos cards das tarefas no ClickUp!',
       }),
     });
-    if (!response.ok) {
-      console.error('[CRON] Erro ao enviar lembrete:', await response.text());
-    } else {
-      console.log('[CRON] Lembrete enviado com sucesso!');
-    }
+    if (!response.ok) console.error('[CRON] Erro:', await response.text());
+    else console.log('[CRON] Lembrete enviado com sucesso!');
   } catch (err) {
     console.error('[CRON] Erro:', err);
   }
@@ -78,34 +93,28 @@ cron.schedule('0 17 * * 1-5', async () => {
 // CLICKUP
 // ─────────────────────────────────────────────
 
-// Extrai o custom ID da task do título do review (ex: "Dev [SD-391]: ..." → "SD-391")
 function extractTaskId(reviewTitle) {
   const match = reviewTitle.match(/\[([A-Z]+-\d+)\]/);
   return match ? match[1] : null;
 }
 
-// Busca a task pelo custom ID e retorna o task ID interno do ClickUp
 async function findTaskByCustomId(customId) {
   if (!CLICKUP_TOKEN || !CLICKUP_TEAM_ID) return null;
-
   try {
-    const url = `https://api.clickup.com/api/v2/team/${CLICKUP_TEAM_ID}/task?custom_task_ids=true&custom_id=${customId}`;
+    const url = `https://api.clickup.com/api/v2/task/${customId}?custom_task_ids=true&team_id=${CLICKUP_TEAM_ID}`;
     const res = await fetch(url, {
       headers: { Authorization: CLICKUP_TOKEN },
     });
-
     if (!res.ok) {
       console.error('[ClickUp] Erro ao buscar task:', res.status, await res.text());
       return null;
     }
-
-    const data = await res.json();
-    const task = data.tasks?.[0];
-    if (!task) {
-      console.warn(`[ClickUp] Task não encontrada para custom ID: ${customId}`);
+    const task = await res.json();
+    if (!task?.id) {
+      console.warn(`[ClickUp] Task "${customId}" não encontrada`);
       return null;
     }
-
+    console.log(`[ClickUp] Task encontrada: ${task.custom_id} (${task.name}) → ID: ${task.id}`);
     return task.id;
   } catch (err) {
     console.error('[ClickUp] Erro na busca:', err);
@@ -113,10 +122,8 @@ async function findTaskByCustomId(customId) {
   }
 }
 
-// Atualiza o status da task no ClickUp
 async function updateTaskStatus(taskId, status) {
   if (!CLICKUP_TOKEN) return;
-
   try {
     const res = await fetch(`https://api.clickup.com/api/v2/task/${taskId}`, {
       method: 'PUT',
@@ -126,32 +133,24 @@ async function updateTaskStatus(taskId, status) {
       },
       body: JSON.stringify({ status }),
     });
-
-    if (!res.ok) {
-      console.error('[ClickUp] Erro ao atualizar status:', res.status, await res.text());
-    } else {
-      console.log(`[ClickUp] Status atualizado para "${status}" na task ${taskId}`);
-    }
+    if (!res.ok) console.error('[ClickUp] Erro ao atualizar status:', res.status, await res.text());
+    else console.log(`[ClickUp] Status atualizado para "${status}" na task ${taskId}`);
   } catch (err) {
     console.error('[ClickUp] Erro ao atualizar:', err);
   }
 }
 
-// Orquestra a busca e atualização pelo título do review
 async function syncClickUp(reviewTitle, eventType) {
   const newStatus = CLICKUP_STATUS[eventType];
   if (!newStatus) return;
-
   const customId = extractTaskId(reviewTitle);
   if (!customId) {
-    console.warn(`[ClickUp] Nenhum ID de task encontrado no título: "${reviewTitle}"`);
+    console.warn(`[ClickUp] Nenhum ID encontrado no título: "${reviewTitle}"`);
     return;
   }
-
   console.log(`[ClickUp] Buscando task ${customId}...`);
   const taskId = await findTaskByCustomId(customId);
   if (!taskId) return;
-
   await updateTaskStatus(taskId, newStatus);
 }
 
@@ -171,20 +170,32 @@ function detectEvent(payload) {
     const comment    = payload.PLASTIC_REVIEW_COMMENT        ?? '';
     const commentAct = payload.PLASTIC_REVIEW_COMMENT_ACTION ?? '';
     const info       = payload.PLASTIC_REVIEW_ACTION_INFO    ?? '';
+    const status     = payload.PLASTIC_REVIEW_STATUS         ?? '';
 
-    if (action === 'add reviewer' || comment.includes('[requested-review-from')) {
-      return 'review_requested';
-    }
+    // Fechamento do review
+    if (status === 'Closed' || action === 'close') return 'review_closed';
+
+    // Abertura — só processa "add reviewer" com ACTION_INFO preenchido
+    // Ignora o evento duplicado "[requested-review-from-EMAIL]" que vem logo depois
+    if (action === 'add reviewer' && info && !info.includes(':')) return 'review_requested';
+
+    // Mudança de status
     if (action === 'update reviewer') {
       if (info.includes(':Reviewed')) return 'status_reviewed';
       if (info.includes(':Rework'))   return 'status_rework';
       return 'ignore';
     }
-    if (commentAct === 'Created' && comment.startsWith('[status-')) return 'ignore';
-    if (commentAct === 'Created' && comment && !comment.startsWith('[')) return 'comment';
+
+    // Ignora comentários automáticos (incluindo o [requested-review-from-EMAIL] duplicado)
+    if (commentAct === 'Created' && comment.startsWith('[')) return 'ignore';
+
+    // Comentário real
+    if (commentAct === 'Created' && comment) return 'comment';
+
     return 'ignore';
   }
 
+  // Payload legado via embeds (não usado em produção)
   const desc = payload.embeds?.[0]?.description ?? '';
   if (desc.includes('requested-review-from')) return 'review_requested';
   if (desc.includes('[status-reviewed]'))     return 'status_reviewed';
@@ -198,9 +209,9 @@ function parsePayload(payload) {
     const actionInfo  = payload.PLASTIC_REVIEW_ACTION_INFO ?? '';
     const actionActor = actionInfo.includes(':') ? actionInfo.split(':')[0] : (payload.PLASTIC_USER ?? '');
     const commentText = payload.PLASTIC_REVIEW_COMMENT ?? '';
-    const reviewerFromComment = commentText.match(/\[requested-review-from-([^\]]+)\]/)?.[1] ?? null;
-    const reviewer = reviewerFromComment
-        ?? (actionInfo && !actionInfo.includes(':') ? actionInfo : null)
+
+    // No "add reviewer" o revisor está no ACTION_INFO diretamente
+    const reviewer = (actionInfo && !actionInfo.includes(':') ? actionInfo : null)
         ?? payload.PLASTIC_REVIEW_ASSIGNEE
         ?? null;
 
@@ -282,6 +293,20 @@ function buildMessage(payload) {
       };
     }
 
+    case 'review_closed':
+      return {
+        content: `A tarefa **${reviewName}** foi integrada no branch Develop 🚀`,
+        embeds: [{
+          title: `🚀 ${reviewName}`,
+          color: 0x57F287,
+          fields: [
+            { name: '📁 Repositório', value: repo || 'desconhecido', inline: true },
+          ],
+          footer: { text: 'Unity Version Control · Integrado na Develop' },
+          timestamp: new Date().toISOString(),
+        }],
+      };
+
     case 'comment':
       return {
         content: `${getMention(actionActor)} adicionou um comentário no review 💬`,
@@ -304,16 +329,25 @@ function buildMessage(payload) {
 }
 
 // ─────────────────────────────────────────────
-// ROTA PRINCIPAL — recebe o webhook do UVCS
+// ROTA PRINCIPAL
 // ─────────────────────────────────────────────
 
 app.post('/uvcs-webhook', async (req, res) => {
   const payload = req.body;
   console.log('[UVCS] Payload recebido:', JSON.stringify(payload, null, 2));
 
-  const { eventType, repo, reviewName } = parsePayload(payload);
+  const { eventType, repo, reviewName, reviewer } = parsePayload(payload);
+
   if (eventType === 'ignore' || eventType === 'under_review') {
     console.log('[UVCS] Evento ignorado:', eventType);
+    return res.sendStatus(200);
+  }
+
+  // Chave de dedup: tipo de evento + review ID + revisor (se houver)
+  const reviewId  = payload.PLASTIC_REVIEW_ID ?? '';
+  const dedupKey  = `${eventType}:${reviewId}:${reviewer ?? ''}`;
+  if (isDuplicate(dedupKey)) {
+    console.log(`[UVCS] Duplicata ignorada: ${dedupKey}`);
     return res.sendStatus(200);
   }
 
@@ -323,9 +357,7 @@ app.post('/uvcs-webhook', async (req, res) => {
     return res.sendStatus(200);
   }
 
-  // Dispara Discord e ClickUp em paralelo
   await Promise.allSettled([
-    // Discord
     fetch(getWebhookUrl(repo), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -335,8 +367,7 @@ app.post('/uvcs-webhook', async (req, res) => {
       else console.log(`[Discord] Mensagem enviada — evento: ${eventType}`);
     }),
 
-    // ClickUp (só para eventos que alteram status)
-    ['review_requested', 'status_reviewed', 'status_rework'].includes(eventType)
+    ['review_requested', 'status_reviewed', 'status_rework', 'review_closed'].includes(eventType)
         ? syncClickUp(reviewName, eventType)
         : Promise.resolve(),
   ]);
@@ -350,6 +381,4 @@ app.post('/uvcs-webhook', async (req, res) => {
 
 app.get('/', (req, res) => res.json({ status: 'online' }));
 
-app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
