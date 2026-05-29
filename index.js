@@ -164,6 +164,19 @@ function getMention(email) {
   return id ? `<@${id}>` : `**${email}**`;
 }
 
+// Verifica se todos os revisores já finalizaram (nenhum com "Under review")
+function allReviewersFinished(payload) {
+  const reviewers = payload.PLASTIC_REVIEW_REVIEWERS ?? '';
+  if (!reviewers) return true; // sem revisores, considera finalizado
+  return !reviewers.split(';').some(r => r.includes(':Under review'));
+}
+
+// Verifica se algum revisor pediu Rework
+function anyReviewerRework(payload) {
+  const reviewers = payload.PLASTIC_REVIEW_REVIEWERS ?? '';
+  return reviewers.split(';').some(r => r.includes(':Rework'));
+}
+
 function detectEvent(payload) {
   if (payload.PLASTIC_REVIEW_ACTION !== undefined) {
     const action     = payload.PLASTIC_REVIEW_ACTION         ?? '';
@@ -179,10 +192,15 @@ function detectEvent(payload) {
     // Ignora o evento duplicado "[requested-review-from-EMAIL]" que vem logo depois
     if (action === 'add reviewer' && info && !info.includes(':')) return 'review_requested';
 
-    // Mudança de status
+    // Mudança de status — só processa quando TODOS os revisores finalizaram
     if (action === 'update reviewer') {
-      if (info.includes(':Reviewed')) return 'status_reviewed';
-      if (info.includes(':Rework'))   return 'status_rework';
+      if (!allReviewersFinished(payload)) {
+        console.log('[UVCS] Revisores ainda pendentes, aguardando todos finalizarem');
+        return 'ignore';
+      }
+      // Se algum pediu Rework, prioriza Rework sobre Reviewed
+      if (anyReviewerRework(payload))     return 'status_rework';
+      if (info.includes(':Reviewed'))     return 'status_reviewed';
       return 'ignore';
     }
 
