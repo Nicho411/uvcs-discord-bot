@@ -34,7 +34,6 @@ const CLICKUP_STATUS = {
   review_requested: 'IN REVIEW',
   status_reviewed:  'ACCEPTED',
   status_rework:    'REJECTED',
-  review_closed:    'COMPLETE',
 };
 
 const PORT = process.env.PORT || 3000;
@@ -64,15 +63,25 @@ function isDuplicate(key) {
 // ─────────────────────────────────────────────
 
 const REMINDER_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_GENERAL || '';
-let ultimoLembrete = null;
+const fs   = require('fs');
+const path = require('path');
+const LOCK_FILE = path.join('/tmp', 'lembrete.lock');
 
 cron.schedule('0 17 * * 1-5', async () => {
   const hoje = new Date().toISOString().slice(0, 10);
-  if (ultimoLembrete === hoje) {
-    console.log('[CRON] Lembrete já enviado hoje, ignorando duplicata');
-    return;
+  // Usa arquivo em /tmp para sobreviver a múltiplas instâncias no mesmo host
+  try {
+    if (fs.existsSync(LOCK_FILE)) {
+      const data = fs.readFileSync(LOCK_FILE, 'utf8').trim();
+      if (data === hoje) {
+        console.log('[CRON] Lembrete já enviado hoje, ignorando duplicata');
+        return;
+      }
+    }
+    fs.writeFileSync(LOCK_FILE, hoje, 'utf8');
+  } catch (err) {
+    console.warn('[CRON] Erro no lock file, continuando mesmo assim:', err.message);
   }
-  ultimoLembrete = hoje;
   console.log('[CRON] Enviando lembrete diário...');
   try {
     const response = await fetch(REMINDER_WEBHOOK_URL, {
@@ -184,9 +193,6 @@ function detectEvent(payload) {
     const commentAct = payload.PLASTIC_REVIEW_COMMENT_ACTION ?? '';
     const info       = payload.PLASTIC_REVIEW_ACTION_INFO    ?? '';
     const status     = payload.PLASTIC_REVIEW_STATUS         ?? '';
-
-    // Fechamento do review
-    if (status === 'Closed' || action === 'close') return 'review_closed';
 
     // Abertura — só processa "add reviewer" com ACTION_INFO preenchido
     // Ignora o evento duplicado "[requested-review-from-EMAIL]" que vem logo depois
@@ -311,20 +317,6 @@ function buildMessage(payload) {
       };
     }
 
-    case 'review_closed':
-      return {
-        content: `A tarefa **${reviewName}** foi integrada no branch Develop 🚀`,
-        embeds: [{
-          title: `🚀 ${reviewName}`,
-          color: 0x57F287,
-          fields: [
-            { name: '📁 Repositório', value: repo || 'desconhecido', inline: true },
-          ],
-          footer: { text: 'Unity Version Control · Integrado na Develop' },
-          timestamp: new Date().toISOString(),
-        }],
-      };
-
     case 'comment':
       return {
         content: `${getMention(actionActor)} adicionou um comentário no review 💬`,
@@ -385,7 +377,7 @@ app.post('/uvcs-webhook', async (req, res) => {
       else console.log(`[Discord] Mensagem enviada — evento: ${eventType}`);
     }),
 
-    ['review_requested', 'status_reviewed', 'status_rework', 'review_closed'].includes(eventType)
+    ['review_requested', 'status_reviewed', 'status_rework'].includes(eventType)
         ? syncClickUp(reviewName, eventType)
         : Promise.resolve(),
   ]);
