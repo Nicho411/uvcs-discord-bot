@@ -25,6 +25,7 @@ const REVIEWER_MAP = {
   'jefsmed@outlook.com':         '190662247603765249',
   'filipefiorentini@gmail.com':  '305950346512039938',
   'cassiolima052000@gmail.com':  '384008601360138240',
+  'nicolaschiquito2023@gmail.com': '1484621389108350987',
 };
 
 const CLICKUP_TOKEN   = process.env.CLICKUP_TOKEN   || '';
