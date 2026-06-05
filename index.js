@@ -1,5 +1,5 @@
 const express = require('express');
-const cron    = require('node-cron');
+const cron = require('node-cron');
 const app = express();
 app.use(express.json());
 
@@ -21,20 +21,20 @@ function getWebhookUrl(repo) {
 
 const REVIEWER_MAP = {
   'nicholaspedroso@outlook.com': '192641612659163137',
-  'francescolpm@gmail.com':      '884441615886856224',
-  'jefsmed@outlook.com':         '190662247603765249',
-  'filipefiorentini@gmail.com':  '305950346512039938',
-  'cassiolima052000@gmail.com':  '384008601360138240',
+  'francescolpm@gmail.com': '884441615886856224',
+  'jefsmed@outlook.com': '190662247603765249',
+  'filipefiorentini@gmail.com': '305950346512039938',
+  'cassiolima052000@gmail.com': '384008601360138240',
   'nicolaschiquito2023@gmail.com': '1484621389108350987',
 };
 
-const CLICKUP_TOKEN   = process.env.CLICKUP_TOKEN   || '';
+const CLICKUP_TOKEN = process.env.CLICKUP_TOKEN || '';
 const CLICKUP_TEAM_ID = process.env.CLICKUP_TEAM_ID || '';
 
 const CLICKUP_STATUS = {
   review_requested: 'IN REVIEW',
-  status_reviewed:  'ACCEPTED',
-  status_rework:    'REJECTED',
+  status_reviewed: 'ACCEPTED',
+  status_rework: 'REJECTED',
 };
 
 const PORT = process.env.PORT || 3000;
@@ -64,7 +64,7 @@ function isDuplicate(key) {
 // ─────────────────────────────────────────────
 
 const REMINDER_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_GENERAL || '';
-const fs   = require('fs');
+const fs = require('fs');
 const path = require('path');
 const LOCK_FILE = path.join('/tmp', 'lembrete.lock');
 
@@ -189,11 +189,15 @@ function anyReviewerRework(payload) {
 
 function detectEvent(payload) {
   if (payload.PLASTIC_REVIEW_ACTION !== undefined) {
-    const action     = payload.PLASTIC_REVIEW_ACTION         ?? '';
-    const comment    = payload.PLASTIC_REVIEW_COMMENT        ?? '';
+    const action = payload.PLASTIC_REVIEW_ACTION ?? '';
+    const comment = payload.PLASTIC_REVIEW_COMMENT ?? '';
     const commentAct = payload.PLASTIC_REVIEW_COMMENT_ACTION ?? '';
-    const info       = payload.PLASTIC_REVIEW_ACTION_INFO    ?? '';
-    const status     = payload.PLASTIC_REVIEW_STATUS         ?? '';
+    const info = payload.PLASTIC_REVIEW_ACTION_INFO ?? '';
+    const status = payload.PLASTIC_REVIEW_STATUS ?? '';
+
+    // Ignora evento de criação do review (after-mkreview) — sem ACTION e sem revisores ainda
+    const isCreationEvent = !action && !commentAct && payload.content?.includes('New code review');
+    if (isCreationEvent) return 'ignore';
 
     // Abertura — só processa "add reviewer" com ACTION_INFO preenchido
     // Ignora o evento duplicado "[requested-review-from-EMAIL]" que vem logo depois
@@ -206,8 +210,8 @@ function detectEvent(payload) {
         return 'ignore';
       }
       // Se algum pediu Rework, prioriza Rework sobre Reviewed
-      if (anyReviewerRework(payload))     return 'status_rework';
-      if (info.includes(':Reviewed'))     return 'status_reviewed';
+      if (anyReviewerRework(payload)) return 'status_rework';
+      if (info.includes(':Reviewed')) return 'status_reviewed';
       return 'ignore';
     }
 
@@ -223,64 +227,64 @@ function detectEvent(payload) {
   // Payload legado via embeds (não usado em produção)
   const desc = payload.embeds?.[0]?.description ?? '';
   if (desc.includes('requested-review-from')) return 'review_requested';
-  if (desc.includes('[status-reviewed]'))     return 'status_reviewed';
-  if (desc.includes('[status-rework]'))       return 'status_rework';
-  if (desc.includes('Under review'))          return 'under_review';
+  if (desc.includes('[status-reviewed]')) return 'status_reviewed';
+  if (desc.includes('[status-rework]')) return 'status_rework';
+  if (desc.includes('Under review')) return 'under_review';
   return 'comment';
 }
 
 function parsePayload(payload) {
   if (payload.PLASTIC_REVIEW_ACTION !== undefined) {
-    const actionInfo  = payload.PLASTIC_REVIEW_ACTION_INFO ?? '';
+    const actionInfo = payload.PLASTIC_REVIEW_ACTION_INFO ?? '';
     const actionActor = actionInfo.includes(':') ? actionInfo.split(':')[0] : (payload.PLASTIC_USER ?? '');
     const commentText = payload.PLASTIC_REVIEW_COMMENT ?? '';
 
     // No "add reviewer" o revisor está no ACTION_INFO diretamente
     const reviewer = (actionInfo && !actionInfo.includes(':') ? actionInfo : null)
-        ?? payload.PLASTIC_REVIEW_ASSIGNEE
-        ?? null;
+      ?? payload.PLASTIC_REVIEW_ASSIGNEE
+      ?? null;
 
     return {
-      actor:       payload.PLASTIC_REVIEW_OWNER    ?? '',
-      actionActor: payload.PLASTIC_USER            ?? '',
+      actor: payload.PLASTIC_REVIEW_OWNER ?? '',
+      actionActor: payload.PLASTIC_USER ?? '',
       statusActor: actionActor,
-      repo:        payload.PLASTIC_REPOSITORY_NAME ?? '',
-      reviewName:  payload.PLASTIC_REVIEW_TITLE    ?? 'Code Review',
-      eventType:   detectEvent(payload),
+      repo: payload.PLASTIC_REPOSITORY_NAME ?? '',
+      reviewName: payload.PLASTIC_REVIEW_TITLE ?? 'Code Review',
+      eventType: detectEvent(payload),
       reviewer,
-      comment:     (!commentText.startsWith('[') ? commentText : null),
-      branch:      payload.PLASTIC_REVIEW_TARGET   ?? '',
-      newStatus:   actionInfo.includes(':') ? actionInfo.split(':')[1] : '',
+      comment: (!commentText.startsWith('[') ? commentText : null),
+      branch: payload.PLASTIC_REVIEW_TARGET ?? '',
+      newStatus: actionInfo.includes(':') ? actionInfo.split(':')[1] : '',
     };
   }
 
   const embed = payload.embeds?.[0] ?? {};
-  const desc  = embed.description ?? '';
+  const desc = embed.description ?? '';
   const reviewerMatch = desc.match(/\[requested-review-from-([^\]]+)\]/);
   return {
-    actor:       embed.title ?? '',
+    actor: embed.title ?? '',
     actionActor: embed.title ?? '',
     statusActor: embed.title ?? '',
-    repo:        embed.footer?.text ?? '',
-    reviewName:  payload.content?.match(/review `([^`]+)`/)?.[1] ?? 'Code Review',
-    eventType:   detectEvent(payload),
-    reviewer:    reviewerMatch ? reviewerMatch[1] : null,
-    comment:     desc.replace(/<plastic:\/\/[^>]+>/g, '').replace(/\[.*?\]/g, '').trim() || null,
-    branch:      '',
-    newStatus:   '',
+    repo: embed.footer?.text ?? '',
+    reviewName: payload.content?.match(/review `([^`]+)`/)?.[1] ?? 'Code Review',
+    eventType: detectEvent(payload),
+    reviewer: reviewerMatch ? reviewerMatch[1] : null,
+    comment: desc.replace(/<plastic:\/\/[^>]+>/g, '').replace(/\[.*?\]/g, '').trim() || null,
+    branch: '',
+    newStatus: '',
   };
 }
 
 function buildMessage(payload) {
   const { actor, actionActor, statusActor, repo, reviewName, eventType, reviewer, comment, newStatus } = parsePayload(payload);
 
-  const ownerMention    = getMention(actor);
+  const ownerMention = getMention(actor);
   const reviewerMention = getMention(reviewer);
-  const statusMention   = getMention(statusActor);
+  const statusMention = getMention(statusActor);
 
   const statusLabel = newStatus.toLowerCase().includes('review') ? 'Reviewed ✅'
-      : newStatus.toLowerCase().includes('rework')  ? 'Rework Required ⚠️'
-          : newStatus;
+    : newStatus.toLowerCase().includes('rework') ? 'Rework Required ⚠️'
+      : newStatus;
 
   switch (eventType) {
 
@@ -291,9 +295,9 @@ function buildMessage(payload) {
           title: `🔍 ${reviewName}`,
           color: 0x5865F2,
           fields: [
-            { name: '✏️ Autor',       value: actor    || 'desconhecido', inline: true },
-            { name: '👤 Revisor',     value: reviewer || 'desconhecido', inline: true },
-            { name: '📁 Repositório', value: repo     || 'desconhecido', inline: true },
+            { name: '✏️ Autor', value: actor || 'desconhecido', inline: true },
+            { name: '👤 Revisor', value: reviewer || 'desconhecido', inline: true },
+            { name: '📁 Repositório', value: repo || 'desconhecido', inline: true },
           ],
           footer: { text: 'Unity Version Control · Novo Review' },
           timestamp: new Date().toISOString(),
@@ -310,7 +314,7 @@ function buildMessage(payload) {
           color,
           fields: [
             { name: '👤 Alterado por', value: statusActor || 'desconhecido', inline: true },
-            { name: '📁 Repositório',  value: repo        || 'desconhecido', inline: true },
+            { name: '📁 Repositório', value: repo || 'desconhecido', inline: true },
           ],
           footer: { text: 'Unity Version Control · Status Atualizado' },
           timestamp: new Date().toISOString(),
@@ -327,7 +331,7 @@ function buildMessage(payload) {
           description: comment ?? undefined,
           fields: [
             { name: '👤 Comentado por', value: actionActor || 'desconhecido', inline: true },
-            { name: '📁 Repositório',   value: repo        || 'desconhecido', inline: true },
+            { name: '📁 Repositório', value: repo || 'desconhecido', inline: true },
           ],
           footer: { text: 'Unity Version Control · Novo Comentário' },
           timestamp: new Date().toISOString(),
@@ -349,14 +353,21 @@ app.post('/uvcs-webhook', async (req, res) => {
 
   const { eventType, repo, reviewName, reviewer } = parsePayload(payload);
 
+  // Ignora webhooks de repositórios não mapeados (outros projetos)
+  const repoConhecido = Object.keys(REPO_WEBHOOKS).some(k => repo.includes(k));
+  if (!repoConhecido) {
+    console.log(`[UVCS] Repositório ignorado (não mapeado): "${repo}"`);
+    return res.sendStatus(200);
+  }
+
   if (eventType === 'ignore' || eventType === 'under_review') {
     console.log('[UVCS] Evento ignorado:', eventType);
     return res.sendStatus(200);
   }
 
   // Chave de dedup: tipo de evento + review ID + revisor (se houver)
-  const reviewId  = payload.PLASTIC_REVIEW_ID ?? '';
-  const dedupKey  = `${eventType}:${reviewId}:${reviewer ?? ''}`;
+  const reviewId = payload.PLASTIC_REVIEW_ID ?? '';
+  const dedupKey = `${eventType}:${reviewId}:${reviewer ?? ''}`;
   if (isDuplicate(dedupKey)) {
     console.log(`[UVCS] Duplicata ignorada: ${dedupKey}`);
     return res.sendStatus(200);
@@ -379,8 +390,8 @@ app.post('/uvcs-webhook', async (req, res) => {
     }),
 
     ['review_requested', 'status_reviewed', 'status_rework'].includes(eventType)
-        ? syncClickUp(reviewName, eventType)
-        : Promise.resolve(),
+      ? syncClickUp(reviewName, eventType)
+      : Promise.resolve(),
   ]);
 
   res.sendStatus(200);
