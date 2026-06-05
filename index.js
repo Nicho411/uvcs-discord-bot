@@ -150,9 +150,29 @@ async function updateTaskStatus(taskId, status) {
   }
 }
 
-async function syncClickUp(reviewTitle, eventType) {
+async function postClickUpComment(taskId, comment, author) {
+  if (!CLICKUP_TOKEN || !comment) return;
+  try {
+    const res = await fetch(`https://api.clickup.com/api/v2/task/${taskId}/comment`, {
+      method: 'POST',
+      headers: {
+        Authorization: CLICKUP_TOKEN,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        comment_text: `**[Code Review - ${author}]**\n${comment}`,
+        notify_all: false,
+      }),
+    });
+    if (!res.ok) console.error('[ClickUp] Erro ao postar comentário:', res.status, await res.text());
+    else console.log(`[ClickUp] Comentário postado na task ${taskId}`);
+  } catch (err) {
+    console.error('[ClickUp] Erro ao postar comentário:', err);
+  }
+}
+
+async function syncClickUp(reviewTitle, eventType, options = {}) {
   const newStatus = CLICKUP_STATUS[eventType];
-  if (!newStatus) return;
   const customId = extractTaskId(reviewTitle);
   if (!customId) {
     console.warn(`[ClickUp] Nenhum ID encontrado no título: "${reviewTitle}"`);
@@ -161,7 +181,12 @@ async function syncClickUp(reviewTitle, eventType) {
   console.log(`[ClickUp] Buscando task ${customId}...`);
   const taskId = await findTaskByCustomId(customId);
   if (!taskId) return;
-  await updateTaskStatus(taskId, newStatus);
+
+  const actions = [];
+  if (newStatus) actions.push(updateTaskStatus(taskId, newStatus));
+  if (options.comment && options.author) actions.push(postClickUpComment(taskId, options.comment, options.author));
+
+  await Promise.allSettled(actions);
 }
 
 // ─────────────────────────────────────────────
@@ -244,6 +269,11 @@ function parsePayload(payload) {
       ?? payload.PLASTIC_REVIEW_ASSIGNEE
       ?? null;
 
+    // Extrai comentário de eventos de status: "[status-rework-required]Texto do comentário"
+    const statusCommentMatch = commentText.match(/^\[status-[^\]]+\](.+)/s);
+    const statusComment = statusCommentMatch ? statusCommentMatch[1].trim() : null;
+    const plainComment = !commentText.startsWith('[') ? commentText : null;
+
     return {
       actor: payload.PLASTIC_REVIEW_OWNER ?? '',
       actionActor: payload.PLASTIC_USER ?? '',
@@ -252,7 +282,8 @@ function parsePayload(payload) {
       reviewName: payload.PLASTIC_REVIEW_TITLE ?? 'Code Review',
       eventType: detectEvent(payload),
       reviewer,
-      comment: (!commentText.startsWith('[') ? commentText : null),
+      comment: plainComment,
+      statusComment,
       branch: payload.PLASTIC_REVIEW_TARGET ?? '',
       newStatus: actionInfo.includes(':') ? actionInfo.split(':')[1] : '',
     };
@@ -276,7 +307,7 @@ function parsePayload(payload) {
 }
 
 function buildMessage(payload) {
-  const { actor, actionActor, statusActor, repo, reviewName, eventType, reviewer, comment, newStatus } = parsePayload(payload);
+  const { actor, actionActor, statusActor, repo, reviewName, eventType, reviewer, comment, statusComment, newStatus } = parsePayload(payload);
 
   const ownerMention = getMention(actor);
   const reviewerMention = getMention(reviewer);
@@ -312,6 +343,7 @@ function buildMessage(payload) {
         embeds: [{
           title: `${eventType === 'status_reviewed' ? '✅' : '⚠️'} ${reviewName}`,
           color,
+          description: statusComment ?? undefined,
           fields: [
             { name: '👤 Alterado por', value: statusActor || 'desconhecido', inline: true },
             { name: '📁 Repositório', value: repo || 'desconhecido', inline: true },
@@ -351,7 +383,7 @@ app.post('/uvcs-webhook', async (req, res) => {
   const payload = req.body;
   console.log('[UVCS] Payload recebido:', JSON.stringify(payload, null, 2));
 
-  const { eventType, repo, reviewName, reviewer } = parsePayload(payload);
+  const { eventType, repo, reviewName, reviewer, statusComment, comment, actionActor } = parsePayload(payload);
 
   // Ignora webhooks de repositórios não mapeados (outros projetos)
   const repoConhecido = Object.keys(REPO_WEBHOOKS).some(k => repo.includes(k));
@@ -390,8 +422,10 @@ app.post('/uvcs-webhook', async (req, res) => {
     }),
 
     ['review_requested', 'status_reviewed', 'status_rework'].includes(eventType)
-      ? syncClickUp(reviewName, eventType)
-      : Promise.resolve(),
+      ? syncClickUp(reviewName, eventType, { comment: statusComment ?? comment, author: actionActor })
+      : eventType === 'comment' && comment
+        ? syncClickUp(reviewName, 'comment', { comment, author: actionActor })
+        : Promise.resolve(),
   ]);
 
   res.sendStatus(200);
