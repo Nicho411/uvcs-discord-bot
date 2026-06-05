@@ -150,8 +150,24 @@ async function updateTaskStatus(taskId, status) {
   }
 }
 
+// Nomes amigáveis para exibir nos comentários do ClickUp
+const FRIENDLY_NAMES = {
+  'nicholaspedroso@outlook.com': 'Nicholas Pedroso',
+  'francescolpm@gmail.com': 'Francesco',
+  'jefsmed@outlook.com': 'Jefferson Medeiros',
+  'filipefiorentini@gmail.com': 'Filipe Fiorentini',
+  'cassiolima052000@gmail.com': 'Cássio Lima',
+  'nicolaschiquito2023@gmail.com': 'Nicolas Chiquito',
+};
+
+function getFriendlyName(email) {
+  return FRIENDLY_NAMES[email?.toLowerCase().trim()] ?? email ?? 'Desconhecido';
+}
+
 async function postClickUpComment(taskId, comment, author) {
   if (!CLICKUP_TOKEN || !comment) return;
+  const nome = getFriendlyName(author);
+  const texto = `🔍 Comentário de Code Review\n👤 Autor: ${nome}\n💬 "${comment}"`;
   try {
     const res = await fetch(`https://api.clickup.com/api/v2/task/${taskId}/comment`, {
       method: 'POST',
@@ -160,12 +176,12 @@ async function postClickUpComment(taskId, comment, author) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        comment_text: `**[Code Review - ${author}]**\n${comment}`,
+        comment_text: texto,
         notify_all: false,
       }),
     });
     if (!res.ok) console.error('[ClickUp] Erro ao postar comentário:', res.status, await res.text());
-    else console.log(`[ClickUp] Comentário postado na task ${taskId}`);
+    else console.log(`[ClickUp] Comentário postado na task ${taskId} como ${nome}`);
   } catch (err) {
     console.error('[ClickUp] Erro ao postar comentário:', err);
   }
